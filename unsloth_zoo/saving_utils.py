@@ -571,9 +571,9 @@ def merge_and_overwrite_lora(
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Directly downloads 16bit original weights and merges LoRA
-    inner_model = model.base_model.model if isinstance(model, PeftModel) else model
+    inner_model = model.base_model.model if isinstance(model, PeftModel) or isinstance(model, PeftModelForCausalLM) else model
     inner_model = inner_model.base_model if hasattr(model, "base_model") else inner_model
-    if not isinstance(model, PeftModel):
+    if not isinstance(model, PeftModel) or not isinstance(model, PeftModelForCausalLM):
         warnings.warn("Model is not a PeftModel (no Lora adapters detected). Skipping Merge. Please use save_pretrained() or push_to_hub() instead!")
         return None
     try:
@@ -734,7 +734,7 @@ def merge_and_overwrite_lora(
     # Default handle 16 bit merge and save/push
     # Step 1: Save base model config/architecture (no weights needed here)
     if save_method == "merged_16bit":
-        config_model = find_lora_base_model(model) if isinstance(model, PeftModel) else model
+        config_model = find_lora_base_model(model) if isinstance(model, PeftModel) or isinstance(model, PeftModelForCausalLM) else model
         config_model.save_pretrained(
             save_directory = save_directory,
             state_dict = {},
