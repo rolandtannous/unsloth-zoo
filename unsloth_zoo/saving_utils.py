@@ -144,14 +144,18 @@ from tqdm import tqdm as ProgressBar
 import os, shutil, re, functools
 
 
-def _merge_lora(W, lora_stats, name):
+def _merge_lora(W, lora_stats, name, mode="high_ram"):
     if lora_stats.lora_A is None or lora_stats.lora_B is None: return W
-    W = W.to("cuda", dtype = torch.float32, non_blocking = True)
-    W = W.addmm_(
-        lora_stats.lora_B.to("cuda", dtype = torch.float32, non_blocking = True),
-        lora_stats.lora_A.to("cuda", dtype = torch.float32, non_blocking = True),
-        alpha = lora_stats.alpha,
-    )
+    non_blocking = True if mode == "high_ram" else False
+    # Sequential transfers to reduce peak memory usage
+    W = W.to("cuda", dtype=torch.float32, non_blocking=non_blocking)  # Wait for completion
+
+    # Transfer lora_B and immediately use it
+    lora_B = lora_stats.lora_B.to("cuda", dtype=torch.float32, non_blocking=non_blocking)
+    lora_A = lora_stats.lora_A.to("cuda", dtype=torch.float32, non_blocking=non_blocking)
+
+    W = W.addmm_(lora_B, lora_A, alpha=lora_stats.alpha)
+
     if not torch.isfinite(torch.amax(W)).item():
         raise ValueError('Unsloth: Merge failed as there are infinite elements in ' + name)
     return W
@@ -405,9 +409,11 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
             #         W = W.to(pinned_cpu.device, dtype=pinned_cpu.dtype, non_blocking=True)
             if lora_stats is not None and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
                     count += 1
-                    W = _merge_lora(W, lora_stats, key)
+                    #W = _merge_lora(W, lora_stats, key, mode="low_ram")
 
                     if psutil.virtual_memory().available <= limit:
+                        W = _merge_lora(W, lora_stats, key, mode="low_ram")
+
                         # Use safetensors for faster serialization/deserialization
                         temp_file = tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False)
                         temp_filename = temp_file.name
@@ -427,6 +433,7 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
                         except:
                             pass
                     else:
+                        W = _merge_lora(W, lora_stats, key, mode="high_ram")
                         # High memory: direct conversion (fastest)
                         pinned_cpu = torch.empty_like(W, device="cpu", pin_memory=True, dtype=output_dtype)
                         W = W.to(pinned_cpu.device, dtype=pinned_cpu.dtype, non_blocking=True)
