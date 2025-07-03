@@ -385,24 +385,52 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
             lora_key = key[:-len(".weight")] if key.endswith(".weight") else key
             lora_stats = converted_lora_weights.get(lora_key, None)
 
+            # if lora_stats is not None and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
+            #     count += 1
+            #     W = _merge_lora(W, lora_stats, key)  # Assume _merge_lora is defined elsewhere
+            #     if psutil.virtual_memory().available <= limit:
+            #         temp_file = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)  # Create temporary file
+            #         temp_filename = temp_file.name  # Get temporary file name
+            #         torch.save(W.to(output_dtype), temp_filename, pickle_module=pickle, pickle_protocol=pickle.HIGHEST_PROTOCOL)
+            #         W = torch.load(temp_filename, map_location="cpu", mmap=True, weights_only=False)
+            #         temp_file.close()  # Close temporary file
+            #         # Clean up the temporary pickle file
+            #         try:
+            #             os.remove(temp_filename)
+            #         except:
+            #             pass
+            #     else:
+            #         # To enable fast async copy from CUDA to CPU, allocate a pinned (page-locked) buffer
+            #         pinned_cpu = torch.empty_like(W, device="cpu", pin_memory=True, dtype=output_dtype)
+            #         W = W.to(pinned_cpu.device, dtype=pinned_cpu.dtype, non_blocking=True)
             if lora_stats is not None and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
-                count += 1
-                W = _merge_lora(W, lora_stats, key)  # Assume _merge_lora is defined elsewhere
-                if psutil.virtual_memory().available <= limit:
-                    temp_file = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)  # Create temporary file
-                    temp_filename = temp_file.name  # Get temporary file name
-                    torch.save(W.to(output_dtype), temp_filename, pickle_module=pickle, pickle_protocol=pickle.HIGHEST_PROTOCOL)
-                    W = torch.load(temp_filename, map_location="cpu", mmap=True, weights_only=False)
-                    temp_file.close()  # Close temporary file
-                    # Clean up the temporary pickle file
-                    try:
-                        os.remove(temp_filename)
-                    except:
-                        pass
-                else:
-                    # To enable fast async copy from CUDA to CPU, allocate a pinned (page-locked) buffer
-                    pinned_cpu = torch.empty_like(W, device="cpu", pin_memory=True, dtype=output_dtype)
-                    W = W.to(pinned_cpu.device, dtype=pinned_cpu.dtype, non_blocking=True)
+                    count += 1
+                    W = _merge_lora(W, lora_stats, key)
+
+                    if psutil.virtual_memory().available <= limit:
+                        # Use safetensors for faster serialization/deserialization
+                        temp_file = tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False)
+                        temp_filename = temp_file.name
+                        temp_file.close()
+
+                        # Save and load with safetensors (much faster than pickle)
+                        from safetensors.torch import save_file, load_file
+                        save_file({"weight": W.to(output_dtype)}, temp_filename)
+
+                        # Load with memory mapping for efficiency
+                        loaded_tensors = load_file(temp_filename, device="cpu")
+                        W = loaded_tensors["weight"]
+
+                        # Clean up
+                        try:
+                            os.remove(temp_filename)
+                        except:
+                            pass
+                    else:
+                        # High memory: direct conversion (fastest)
+                        pinned_cpu = torch.empty_like(W, device="cpu", pin_memory=True, dtype=output_dtype)
+                        W = W.to(pinned_cpu.device, dtype=pinned_cpu.dtype, non_blocking=True)
+
             else:
                 if lora_key in converted_lora_weights:
                     lora_stats_info = converted_lora_weights[lora_key]
