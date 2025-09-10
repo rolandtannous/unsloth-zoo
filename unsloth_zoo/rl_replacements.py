@@ -66,7 +66,7 @@ def calculate_pad_tokens_in_prompt(
         pad_token_id: int
     ) -> torch.Tensor:
         """
-        Given prompt tensor, it returns all the left padded tokens in that sequence. so [pad, pad, pad, cat] = 3 tokens 
+        Given prompt tensor, it returns all the left padded tokens in that sequence. so [pad, pad, pad, cat] = 3 tokens
         """
         if logits_to_keep >= input_ids.shape[1]:
             raise ValueError("logits_to_keep must be smaller than the sequence length.")
@@ -162,7 +162,7 @@ def grpo_compute_loss(
     with torch.no_grad():
         if beta != 0.0:
             assert ref_logits is not None, "ref_logits should not be None when beta != 0.0"
-            
+
             # Optional logit softcapping and logit dividing
             if logit_scale_multiply != 0: ref_logits = ref_logits * logit_scale_multiply
             if logit_scale_divide   != 0: ref_logits = ref_logits / logit_scale_divide
@@ -201,7 +201,7 @@ def grpo_compute_loss(
 
     # Below is forward KL (normal KL)
     # kl_i = torch.exp(old) * (old - new)
-    if old_logits is not None: 
+    if old_logits is not None:
         log_ratio = new - old
     else:
         log_ratio = new - new.detach()
@@ -250,7 +250,7 @@ def grpo_compute_loss(
         raise ValueError(f"Unknown loss type: {loss_type}")
 
     # loss = (loss_i * mask).sum() / mask.sum()
-    
+
     # Get metrics as well which are folded
     with torch.inference_mode():
         completion_length = n_mask_per_reward.mean()
@@ -283,17 +283,17 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             with torch.no_grad():
                 if beta != 0.0:
                     ref_logits = torch.matmul(ref_hidden_states, lm_head.t())
-                    ref_logits = ref_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
+                    ref_logits = ref_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
                 else:
                     ref_logits = None
                 if old_hidden_states is not None:
                     old_logits = torch.matmul(old_hidden_states, lm_head.t())
-                    old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
-                else: 
+                    old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
+                else:
                     old_logits = None
-            # if old_hidden_states is not None: 
+            # if old_hidden_states is not None:
             #     old_logits = torch.matmul(old_hidden_states, lm_head.t()) #last logit already excluded
-            #     old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
+            #     old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
             # else:
             #     old_logits = None
             # unsloth_zoo/rl_replacements.py
@@ -351,13 +351,13 @@ class UnslothEfficientGRPO(torch.autograd.Function):
 
         grad_inputs_chunks = torch.chunk(grad_inputs,        chunks = n_chunks, dim = 0)
         new_hidden_states  = torch.chunk(_new_hidden_states, chunks = n_chunks, dim = 0)
-        if _old_hidden_states is not None: 
+        if _old_hidden_states is not None:
             old_hidden_states  = torch.chunk(_old_hidden_states, chunks = n_chunks, dim = 0)
-        else: 
+        else:
             old_hidden_states = [None] * n_chunks
-        if _ref_hidden_states is not None: 
+        if _ref_hidden_states is not None:
             ref_hidden_states  = torch.chunk(_ref_hidden_states, chunks = n_chunks, dim = 0)
-        else: 
+        else:
             ref_hidden_states = [None] * n_chunks
         input_ids          = torch.chunk(_input_ids,         chunks = n_chunks, dim = 0)
         mask               = torch.chunk(_mask,              chunks = n_chunks, dim = 0)
@@ -376,11 +376,11 @@ class UnslothEfficientGRPO(torch.autograd.Function):
 
             # mark_dynamic(new_hidden_states_j)
             # mark_dynamic(ref_hidden_states_j)
-            # if old_hidden_states_j is not None: 
+            # if old_hidden_states_j is not None:
             #     mark_dynamic(old_hidden_states_j)
             # mark_dynamic(input_ids_j)
             # mark_dynamic(mask_j)
-            
+
             accumulate_chunk(
                 new_hidden_states_j,
                 old_hidden_states_j,
@@ -422,7 +422,7 @@ def grpo_accumulated_loss(
     completion_mask,
     advantages,
     old_hidden_states,
-    ref_hidden_states, 
+    ref_hidden_states,
     n_chunks = -1,
     **kwargs,
 ):
@@ -446,7 +446,7 @@ def grpo_accumulated_loss(
 
     lm_head = trainer.model.get_output_embeddings().weight
 
-    if pixel_values is None: 
+    if pixel_values is None:
         left_pad_tokens_per_prompt = calculate_pad_tokens_in_prompt(input_ids, logits_to_keep, trainer.processing_class.pad_token_id)
 
         max_left_pad = max(left_pad_tokens_per_prompt).item()
@@ -458,11 +458,11 @@ def grpo_accumulated_loss(
         completion_mask = create_completion_attention_mask(completion_input_ids, left_pad_tokens_per_prompt, max_left_pad, trainer.processing_class.pad_token_id).to(attention_mask.dtype)
         attention_mask =  input_ids != trainer.processing_class.pad_token_id
         attention_mask = attention_mask.to(attention_mask.dtype)
-    else: 
+    else:
         completion_input_ids = input_ids[:, -logits_to_keep:]
-    
+
     unwrapped_model = trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False)
-    with torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype):  
+    with torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype):
         if pixel_values is None:
             new_hidden_states = unwrapped_model(
                     input_ids = input_ids,
@@ -476,11 +476,11 @@ def grpo_accumulated_loss(
 
             #keep extra logit as we generated a new token
             new_hidden_states = new_hidden_states[:, -(logits_to_keep +max_left_pad+1): , :]
-            if ref_hidden_states is not None: 
+            if ref_hidden_states is not None:
                 ref_hidden_states = ref_hidden_states[:, -(logits_to_keep +max_left_pad+1): , :]
-            if old_hidden_states is not None: 
+            if old_hidden_states is not None:
                 old_hidden_states = old_hidden_states[:, -(logits_to_keep +max_left_pad+1): , :]
-        else: 
+        else:
             new_hidden_states = unwrapped_model(
                 input_ids = input_ids,
                 attention_mask = attention_mask,
