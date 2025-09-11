@@ -156,12 +156,12 @@ from tqdm import tqdm as ProgressBar
 import os, shutil, re, functools
 
 
-def _merge_lora(W, lora_stats, name):
+def _merge_lora(W, lora_stats, name, device):
     if lora_stats.lora_A is None or lora_stats.lora_B is None: return W
-    W = W.to("cuda", dtype = torch.float32, non_blocking = True)
+    W = W.to(device, dtype = torch.float32, non_blocking = True)
     W = W.addmm_(
-        lora_stats.lora_B.to("cuda", dtype = torch.float32, non_blocking = True),
-        lora_stats.lora_A.to("cuda", dtype = torch.float32, non_blocking = True),
+        lora_stats.lora_B.to(device, dtype = torch.float32, non_blocking = True),
+        lora_stats.lora_A.to(device, dtype = torch.float32, non_blocking = True),
         alpha = lora_stats.alpha,
     )
     if not torch.isfinite(torch.amax(W)).item():
@@ -419,9 +419,7 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
 
                         blocks_tensor, scales_tensor = file.get_tensor(key), file.get_tensor(scales_key)
 
-                        if torch.cuda.is_available():
-                          torch.cuda.synchronize()  # Wait for previous operations to complete
-                          torch.cuda.empty_cache()
+                        conservative_memory_cleanup("between_operations")
 
                         # Determine optimal device and chunk size for mxfp4 dequantization
                         device_type, device_id, rows_per_chunk = _choose_mxfp4_processing_strategy(
@@ -437,7 +435,7 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
                                     blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
                                 ).transpose(1, 2).contiguous()
                                 if UNSLOTH_ENABLE_LOGGING:
-                                    logger.info(f"[DEBUG] Using CPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
+                                    logger.debug(f"[DEBUG] Using CPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
                             except ImportError:
                                 # Fallback to original function
                                 W = convert_moe_packed_tensors(
@@ -449,18 +447,23 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
                                 blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
                             ).transpose(1, 2).contiguous()
                             if UNSLOTH_ENABLE_LOGGING:
-                                logger.info(f"[DEBUG] Using GPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
+                                logger.debug(f"[DEBUG] Using GPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
 
+                        del blocks_tensor, scales_tensor
                         processed_mxfp4_keys.add(key); processed_mxfp4_keys.add(scales_key)
 
                         lora_stats = converted_lora_weights.get(base_name, None)
                         if lora_stats and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
                             if UNSLOTH_ENABLE_LOGGING:
-                                logger.info(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING LoRA into Key Group: {base_name}")
-                            count += 1; W = _merge_lora(W, lora_stats, output_key)
+                                logger.debug(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING LoRA into Key Group: {base_name}")
+                            count += 1;
+                            merge_device = _choose_merge_device(W, lora_stats, output_key)
+                            if UNSLOTH_ENABLE_LOGGING:
+                                logger.debug(f"[DEBUG] Merging {output_key} on device '{merge_device}'.")
+                            W = _merge_lora(W, lora_stats, output_key, device=merge_device)
                         else:
                             if UNSLOTH_ENABLE_LOGGING:
-                                logger.info(f"[DEBUG] DEQUANTIZING MXFP4 Key Group: {base_name}")
+                                logger.debug(f"[DEBUG] DEQUANTIZING MXFP4 Key Group: {base_name}")
                         action_logged = True
 
                     elif key.endswith("_scales"):
@@ -480,13 +483,16 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
             if W is not None and lora_stats is not None and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
                 if not action_logged:
                     count += 1
-                    W = _merge_lora(W, lora_stats, output_key)  # Assume _merge_lora is defined elsewhere
+                    merge_device = _choose_merge_device(W, lora_stats, output_key)
+                    if UNSLOTH_ENABLE_LOGGING:
+                        logger.debug(f"[DEBUG] Merging {output_key} on device '{merge_device}'.")
+                    W = _merge_lora(W, lora_stats, output_key, device=merge_device)  # Assume _merge_lora is defined elsewhere
                     action_logged=True
 
             if W is None:
                 continue
 
-            with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as temp_file:
+            with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as temp_file:
                 temp_filename = temp_file.name
                 # Save the merged tensor to a unique temp file
                 torch.save(W.to(output_dtype), temp_filename, pickle_module=pickle, pickle_protocol=pickle.HIGHEST_PROTOCOL)
@@ -501,6 +507,7 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
                 pass
 
             tensors[output_key] = W
+            del W
 
             # Free up VRAM after each merge
             torch.cuda.empty_cache()
@@ -728,6 +735,10 @@ def merge_and_overwrite_lora(
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Directly downloads 16bit original weights and merges LoRA
+    gc.collect()
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
+    conservative_memory_cleanup("between_operations")
+
     inner_model = model.base_model.model if isinstance(model, PeftModel) else model
     inner_model = inner_model.base_model if hasattr(model, "base_model") else inner_model
     if not isinstance(model, PeftModel):
@@ -740,11 +751,13 @@ def merge_and_overwrite_lora(
 
     final_model_name, is_local_path, source_info, base_model_is_quantized, quant_type = determine_base_model_source(model_name, token)
     if base_model_is_quantized and (quant_type == "nf4" or quant_type == "fp4") and save_method== "merged_16bit":
-        raise TypeError("Base model should be a 16bits or mxfp4 base model for a 16bit model merge. Use `save_method=forced_merged_4bit` instead")
+        warnings.warn("Base model should be a 16bits or mxfp4 base model for a 16bit model merge. Use `save_method=forced_merged_4bit` instead")
+        return None
     model_name = final_model_name
     safetensors_list = []
     max_size_in_bytes = 0
     total_size_in_bytes = 0
+    config = model.config
 
     # Handle case for local model where config._name_or_path is a local os path
     # https://github.com/unslothai/unsloth/issues/2140
@@ -844,7 +857,9 @@ def merge_and_overwrite_lora(
     pass
 
     # Save config / generation_config via no state_dict and tokenizer
-    if tokenizer is not None: tokenizer.save_pretrained(save_directory = save_directory,)
+    if tokenizer is not None:
+        tokenizer.save_pretrained(save_directory = save_directory,)
+
 
     # --- Handle 4-bit merging first ---
     if save_method == "merged_4bit" or save_method == "forced_merged_4bit":
@@ -896,20 +911,7 @@ def merge_and_overwrite_lora(
     # Default handle 16 bit merge and save/push
     # Step 1: Save base model config/architecture (no weights needed here)
     if save_method == "merged_16bit":
-        config_model = find_lora_base_model(model) if isinstance(model, PeftModel) else model
-        config_model.save_pretrained(
-            save_directory = save_directory,
-            state_dict = {},
-        )
-        # Remove any weight files that shouldn't have been saved (transformers 4.56.0 bug)
-        import glob
-        weight_files = glob.glob(os.path.join(save_directory, "*.bin")) + \
-                       glob.glob(os.path.join(save_directory, "*.safetensors"))
-
-        for weight_file in weight_files:
-            os.remove(weight_file)
-            print(f"DEBUG: Removed incorrectly saved weight file: {os.path.basename(weight_file)}")
-
+        config.save_pretrained(save_directory)
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         # Remove the quantization_config in the config.json file if it exists,
     # as we are exporting the model in 16-bit format.
@@ -933,6 +935,7 @@ def merge_and_overwrite_lora(
                 local_index_path = os.path.join(model_name, "model.safetensors.index.json")
                 if os.path.exists(local_index_path):
                     shutil.copy2(local_index_path, os.path.join(save_directory, "model.safetensors.index.json"))
+                    conservative_memory_cleanup("between_operations")
         else:
             # Download from HF
             if "model.safetensors.index.json" in [f for f in safe_tensor_index_files]:
@@ -951,6 +954,7 @@ def merge_and_overwrite_lora(
             hf_cache_dir=_hf_cache_dir,
             token=token,
         )
+        conservative_memory_cleanup("between_operations")
 
     if not copied_all_from_cache and not low_disk_space_usage and not is_local_path:
         print(f"Downloading safetensors for {model_name}...")
@@ -959,7 +963,7 @@ def merge_and_overwrite_lora(
             local_dir = save_directory,
             allow_patterns = safe_tensor_index_files + safetensors_list,
         )
-
+        conservative_memory_cleanup("between_operations")
 
     # Step 5: Iterate through original shards, merge LoRA, and overwrite/save
     for filename in ProgressBar(safetensors_list, desc = "Unsloth: Merging weights into 16bit"):
@@ -972,7 +976,7 @@ def merge_and_overwrite_lora(
             if os.path.exists(local_file_path):
                 shutil.copy2(local_file_path, file_path)
                 print(f"Copied {filename} from local model directory")
-
+                conservative_memory_cleanup("between_operations")
         elif not copied_all_from_cache and low_disk_space_usage and not os.path.exists(file_path) and not is_local_path:
             hf_hub_download(
                 repo_id = model_name,
@@ -980,6 +984,7 @@ def merge_and_overwrite_lora(
                 repo_type = "model",
                 local_dir = save_directory,
             )
+            conservative_memory_cleanup("between_operations")
         pass
         n_saved_modules += _merge_and_overwrite_lora(
             save_directory = save_directory,
@@ -990,6 +995,7 @@ def merge_and_overwrite_lora(
             base_model_is_quantized = base_model_is_quantized,
             quant_type=quant_type,
         )
+        conservative_memory_cleanup("between_operations")
         torch.cuda.empty_cache()
         if low_disk_space_usage and push_to_hub:
             upload_items(filename)
@@ -1017,7 +1023,7 @@ def merge_and_overwrite_lora(
 
         if push_to_hub:
             upload_items("model.safetensors.index.json")
-        print("Unsloth: Merge process completed.")
+        print("Unsloth: Merge process complete.")
 
     # Step 7: Final upload of all shards if not using low disk space mode and pushing
     if not low_disk_space_usage and push_to_hub:
@@ -1048,7 +1054,8 @@ def merge_and_overwrite_lora(
         except Exception as e:
             print(f"Warning: Failed to remove temporary directory {save_directory}: {e}")
     pass
-
+    print("Unsloth: Merge process complete.")
+    conservative_memory_cleanup("between_operations")
     return save_directory
 pass
 
@@ -1889,6 +1896,104 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
 
     return (best_fallback['device_type'], best_fallback['device_id'], fallback_chunk_size)
 pass
+
+def _choose_merge_device(W, lora_stats, key):
+    """
+    Chooses the optimal device (CPU or GPU) to perform a LoRA merge based on memory requirements.
+    """
+    if not torch.cuda.is_available():
+        return "cpu"
+
+    lora_A = lora_stats.lora_A
+    lora_B = lora_stats.lora_B
+    if lora_A is None or lora_B is None:
+        return W.device if isinstance(W, torch.Tensor) else "cpu"
+
+    # Memory cost is for the float32 versions of the matrices
+    memory_cost = (W.numel() + lora_A.numel() + lora_B.numel()) * 4 # 4 bytes for float32
+
+    stats = get_memory_stats()
+    chosen_device = None
+
+    # Device-specific safety factors
+    GPU_SAFETY_FACTOR = 0.80  # Leave 20% free VRAM
+    CPU_SAFETY_FACTOR = 0.75  # Leave 25% free RAM
+
+    def calculate_safe_usable_memory(free_memory, safety_factor):
+        return free_memory * safety_factor
+
+    # Check GPU VRAM first
+    if stats['gpus']:
+        gpu_safe_usable_memory = calculate_safe_usable_memory(
+            free_memory=stats['gpus'][0]['free'],
+            safety_factor=GPU_SAFETY_FACTOR,
+        )
+        if gpu_safe_usable_memory > memory_cost:
+            chosen_device = "cuda"
+
+    # Check CPU RAM as a fallback if GPU is not chosen
+    if chosen_device is None:
+        cpu_safe_usable_memory = calculate_safe_usable_memory(
+            free_memory=stats['cpu']['available'],
+            safety_factor=CPU_SAFETY_FACTOR,
+        )
+        if cpu_safe_usable_memory > memory_cost:
+            warnings.warn(
+                f"Unsloth: Not enough VRAM to merge LoRA layers for '{key}'. "
+                f"Required: {format_bytes(memory_cost)}. Merging on CPU. This will be slower."
+            )
+            chosen_device = "cpu"
+
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.debug(
+            f"[DEBUG] Merge stats for '{key}': "
+            f"Cost = {format_bytes(memory_cost)}. "
+            f"Chosen device = '{chosen_device}'."
+        )
+
+    # If neither has enough memory, raise an error
+    if chosen_device is None:
+        raise RuntimeError(
+            f"Unsloth: Not enough memory to merge LoRA layer '{key}' ({W.shape}).\n"
+            f"Required memory: {format_bytes(memory_cost)}.\n"
+            f"Available VRAM (safe): {format_bytes(gpu_safe_usable_memory)}.\n"
+            f"Available RAM (safe): {format_bytes(cpu_safe_usable_memory)}."
+        )
+
+    return chosen_device
+pass
+
+def conservative_memory_cleanup(stage=""):
+    """
+    Cleanup
+    """
+    if UNSLOTH_ENABLE_LOGGING:
+        pre_stats = get_memory_stats()
+        logger.debug(f"[CLEANUP] Before {stage}: RSS={format_bytes(pre_stats['cpu']['used'])}")
+
+    # Python garbage collection (always safe)
+    for _ in range(3):
+        gc.collect()
+
+    # Clear unused GPU memory (safe, doesn't clear context/kernels)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()  # Only clears unused allocations
+        torch.cuda.synchronize()
+
+    # OS-level memory compaction (safe)
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)  # Return unused heap to OS
+    except:
+        pass
+
+    if UNSLOTH_ENABLE_LOGGING:
+        post_stats = get_memory_stats()
+        freed = pre_stats['cpu']['used'] - post_stats['cpu']['used']
+        logger.debug(f"[CLEANUP] After {stage}: RSS={format_bytes(post_stats['cpu']['used'])}, Freed={format_bytes(freed)}")
+pass
+
+
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
