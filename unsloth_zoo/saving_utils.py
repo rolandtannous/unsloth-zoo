@@ -2801,7 +2801,7 @@ pass
 #         logger.debug(f"[MEMORY_AWARE_BATCH] Projected total: {format_bytes(projected_memory)}")
 #
 #     return max(1, len(current_batch_tensors) + tensors_to_add)
-def calculate_memory_aware_batch_size(current_batch_tensors, next_tensor_info_list, converted_lora_weights, output_dtype, safety_factor=0.85):  # Increased from 0.85 to 0.90
+def calculate_memory_aware_batch_size(current_batch_tensors, next_tensor_info_list, converted_lora_weights, output_dtype, safety_factor=0.85):
     """
     Calculate batch size based on actual memory costs of upcoming tensors
     """
@@ -2817,11 +2817,11 @@ def calculate_memory_aware_batch_size(current_batch_tensors, next_tensor_info_li
 
     remaining_budget = safe_memory_budget - current_batch_memory
 
-    # AGGRESSIVE SIZING: Look ahead at MORE tensors and be less conservative
+    # Look ahead at next tensors and their actual costs
     tensors_to_add = 0
     projected_memory = current_batch_memory
 
-    for tensor_info in next_tensor_info_list[:100]:  # Increased from 20 to 100
+    for tensor_info in next_tensor_info_list[:100]:
         key, W = tensor_info['key'], tensor_info['tensor']
         lora_key = key[:-len(".weight")] if key.endswith(".weight") else key
         lora_stats = converted_lora_weights.get(lora_key, None)
@@ -2833,21 +2833,29 @@ def calculate_memory_aware_batch_size(current_batch_tensors, next_tensor_info_li
         else:
             break
 
-    # MINIMUM BATCH SIZE: Ensure batches aren't too small
-    min_batch_size = 100  # Force minimum 50 tensors per batch
-    target_batch_size = max(min_batch_size, len(current_batch_tensors) + tensors_to_add)
+    calculated_batch_size = len(current_batch_tensors) + tensors_to_add
+
+    # FIXED LOGIC: Only apply minimum if we're not already over budget
+    if current_batch_memory <= safe_memory_budget:
+        # We have room - apply minimum batch size
+        min_batch_size = 50  # Reduced from 100 to be more conservative
+        target_batch_size = max(min_batch_size, calculated_batch_size)
+    else:
+        # We're already over budget - process immediately, ignore minimum
+        target_batch_size = len(current_batch_tensors)  # Process current batch now
 
     if UNSLOTH_ENABLE_LOGGING:
         logger.debug(f"[MEMORY_AWARE_BATCH] Available: {format_bytes(available_memory)}")
         logger.debug(f"[MEMORY_AWARE_BATCH] Budget: {format_bytes(safe_memory_budget)}")
         logger.debug(f"[MEMORY_AWARE_BATCH] Current batch: {format_bytes(current_batch_memory)}")
         logger.debug(f"[MEMORY_AWARE_BATCH] Can add {tensors_to_add} more tensors")
+        logger.debug(f"[MEMORY_AWARE_BATCH] Calculated size: {calculated_batch_size}")
         logger.debug(f"[MEMORY_AWARE_BATCH] Target batch size: {target_batch_size}")
         logger.debug(f"[MEMORY_AWARE_BATCH] Projected total: {format_bytes(projected_memory)}")
+        logger.debug(f"[MEMORY_AWARE_BATCH] Over budget: {current_batch_memory > safe_memory_budget}")
 
-    return target_batch_size
+    return target_batch_size# Unsloth Zoo - Utilities for Unsloth
 pass
-# Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
