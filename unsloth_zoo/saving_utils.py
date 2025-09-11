@@ -509,6 +509,8 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
         recalc_frequency = 25    # Recalculate every 25 tensors instead of every tensor
         sample_size = min(200, len(safetensor_keys))
         sample_keys = [k for k in safetensor_keys[:sample_size] if k not in processed_mxfp4_keys]
+        total_sampled_memory = 0
+        sample_count = 0
 
         for key in sample_keys[:50]:
             try:
