@@ -504,13 +504,22 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
 
         # Pre-calculate tensor info for look-ahead (first 100 tensors for memory estimation)
         tensor_info_list = []
-        sample_keys = [k for k in safetensor_keys[:100] if k not in processed_mxfp4_keys]
+        # Add these variables after tensor_info_list creation
+        optimal_batch_size = 50  # Initial batch size
+        recalc_frequency = 25    # Recalculate every 25 tensors instead of every tensor
+        sample_size = min(200, len(safetensor_keys))
+        sample_keys = [k for k in safetensor_keys[:sample_size] if k not in processed_mxfp4_keys]
 
-        for key in sample_keys:
+        for key in sample_keys[:50]:
             try:
                 W_sample = file.get_tensor(key)
                 lora_key = key[:-len(".weight")] if key.endswith(".weight") else key
                 lora_stats = converted_lora_weights.get(lora_key, None)
+
+                tensor_memory = calculate_tensor_memory_cost(W_sample, lora_stats, output_dtype)
+                total_sampled_memory += tensor_memory
+                sample_count += 1
+
                 tensor_info_list.append({
                     'key': key,
                     'tensor': W_sample,
@@ -518,6 +527,8 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
                 })
             except:
                 continue
+        # Calculate average for better batch size estimation
+        avg_tensor_memory = total_sampled_memory / max(1, sample_count)
         detailed_memory_tracking("AFTER_TENSOR_SAMPLING", filename, f"Sampled {len(tensor_info_list)} tensors")
 
         # BATCHED PROCESSING
@@ -586,14 +597,24 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
             del W
 
             # Calculate optimal batch size based on current memory state and upcoming tensors
-            remaining_tensor_info = [info for info in tensor_info_list if info['key'] not in current_batch_tensors]
-            optimal_batch_size = calculate_memory_aware_batch_size(
-                current_batch_tensors,
-                remaining_tensor_info,
-                converted_lora_weights,
-                output_dtype,
-                safety_factor=0.85
-            )
+            # remaining_tensor_info = [info for info in tensor_info_list if info['key'] not in current_batch_tensors]
+            # optimal_batch_size = calculate_memory_aware_batch_size(
+            #     current_batch_tensors,
+            #     remaining_tensor_info,
+            #     converted_lora_weights,
+            #     output_dtype,
+            #     safety_factor=0.85
+            # )
+            # OPTIMIZED: Only recalculate batch size periodically, not every tensor
+            if len(current_batch_tensors) % recalc_frequency == 0:
+                remaining_tensor_info = [info for info in tensor_info_list if info['key'] not in current_batch_tensors]
+                optimal_batch_size = calculate_memory_aware_batch_size(
+                    current_batch_tensors,
+                    remaining_tensor_info,
+                    converted_lora_weights,
+                    output_dtype,
+                    safety_factor=0.90  # Increased
+                )
 
             # Process batch when optimal size reached OR last tensor
             should_process_batch = (
@@ -1133,6 +1154,13 @@ def merge_and_overwrite_lora(
     import os
     #os.environ['HF_XET_CHUNK_CACHE_SIZE_BYTES']='0'
     #os.environ['HF_HUB_DISABLE_XET']="1"
+    # OPTIMIZATION: HuggingFace download optimization
+    os.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '600'  # 10 minutes timeout
+    os.environ['HF_HUB_DOWNLOAD_MAX_RETRIES'] = '5'
+    os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '1'  # Use faster rust-based downloader
+    os.environ['HF_XET_CHUNK_CACHE_SIZE_BYTES'] = str(1024 * 1024 * 1024)
+    gc.collect()
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
     conservative_memory_cleanup("between_operations")
     detailed_memory_tracking("MERGE_START", "Initial state")
     # All Unsloth Zoo code licensed under LGPLv3
@@ -2668,13 +2696,57 @@ def conservative_memory_cleanup(stage=""):
         logger.debug(f"[CLEANUP] After {stage}: RSS={format_bytes(post_stats['cpu']['used'])}, Freed={format_bytes(freed)}")
 pass
 
-def calculate_memory_aware_batch_size(current_batch_tensors, next_tensor_info_list, converted_lora_weights, output_dtype, safety_factor=0.85):
+# def calculate_memory_aware_batch_size(current_batch_tensors, next_tensor_info_list, converted_lora_weights, output_dtype, safety_factor=0.85):
+#     """
+#     Calculate batch size based on actual memory costs of upcoming tensors
+#     """
+#     stats = get_memory_stats()
+#     available_memory = stats['cpu']['available']
+#     safe_memory_budget = int(available_memory * safety_factor)  # Increased to 85%
+#
+#     # Calculate current batch memory usage
+#     current_batch_memory = sum(
+#         calculate_tensor_memory_cost(tensor, None, output_dtype)
+#         for tensor in current_batch_tensors.values()
+#     )
+#
+#     remaining_budget = safe_memory_budget - current_batch_memory
+#
+#     # Look ahead at next tensors and their actual costs
+#     tensors_to_add = 0
+#     projected_memory = current_batch_memory
+#
+#     for tensor_info in next_tensor_info_list[:20]:  # Look ahead at next 20 tensors
+#         key, W = tensor_info['key'], tensor_info['tensor']
+#
+#         # Get actual LoRA stats for this specific tensor
+#         lora_key = key[:-len(".weight")] if key.endswith(".weight") else key
+#         lora_stats = converted_lora_weights.get(lora_key, None)
+#
+#         # Calculate EXACT memory cost for this specific tensor
+#         tensor_memory_cost = calculate_tensor_memory_cost(W, lora_stats, output_dtype)
+#
+#         if projected_memory + tensor_memory_cost <= safe_memory_budget:
+#             tensors_to_add += 1
+#             projected_memory += tensor_memory_cost
+#         else:
+#             break  # Would exceed budget
+#
+#     if UNSLOTH_ENABLE_LOGGING:
+#         logger.debug(f"[MEMORY_AWARE_BATCH] Available: {format_bytes(available_memory)}")
+#         logger.debug(f"[MEMORY_AWARE_BATCH] Budget: {format_bytes(safe_memory_budget)}")
+#         logger.debug(f"[MEMORY_AWARE_BATCH] Current batch: {format_bytes(current_batch_memory)}")
+#         logger.debug(f"[MEMORY_AWARE_BATCH] Can add {tensors_to_add} more tensors")
+#         logger.debug(f"[MEMORY_AWARE_BATCH] Projected total: {format_bytes(projected_memory)}")
+#
+#     return max(1, len(current_batch_tensors) + tensors_to_add)
+def calculate_memory_aware_batch_size(current_batch_tensors, next_tensor_info_list, converted_lora_weights, output_dtype, safety_factor=0.90):  # Increased from 0.85 to 0.90
     """
     Calculate batch size based on actual memory costs of upcoming tensors
     """
     stats = get_memory_stats()
     available_memory = stats['cpu']['available']
-    safe_memory_budget = int(available_memory * safety_factor)  # Increased to 85%
+    safe_memory_budget = int(available_memory * safety_factor)
 
     # Calculate current batch memory usage
     current_batch_memory = sum(
@@ -2684,34 +2756,36 @@ def calculate_memory_aware_batch_size(current_batch_tensors, next_tensor_info_li
 
     remaining_budget = safe_memory_budget - current_batch_memory
 
-    # Look ahead at next tensors and their actual costs
+    # AGGRESSIVE SIZING: Look ahead at MORE tensors and be less conservative
     tensors_to_add = 0
     projected_memory = current_batch_memory
 
-    for tensor_info in next_tensor_info_list[:20]:  # Look ahead at next 20 tensors
+    for tensor_info in next_tensor_info_list[:100]:  # Increased from 20 to 100
         key, W = tensor_info['key'], tensor_info['tensor']
-
-        # Get actual LoRA stats for this specific tensor
         lora_key = key[:-len(".weight")] if key.endswith(".weight") else key
         lora_stats = converted_lora_weights.get(lora_key, None)
-
-        # Calculate EXACT memory cost for this specific tensor
         tensor_memory_cost = calculate_tensor_memory_cost(W, lora_stats, output_dtype)
 
         if projected_memory + tensor_memory_cost <= safe_memory_budget:
             tensors_to_add += 1
             projected_memory += tensor_memory_cost
         else:
-            break  # Would exceed budget
+            break
+
+    # MINIMUM BATCH SIZE: Ensure batches aren't too small
+    min_batch_size = 50  # Force minimum 50 tensors per batch
+    target_batch_size = max(min_batch_size, len(current_batch_tensors) + tensors_to_add)
 
     if UNSLOTH_ENABLE_LOGGING:
         logger.debug(f"[MEMORY_AWARE_BATCH] Available: {format_bytes(available_memory)}")
         logger.debug(f"[MEMORY_AWARE_BATCH] Budget: {format_bytes(safe_memory_budget)}")
         logger.debug(f"[MEMORY_AWARE_BATCH] Current batch: {format_bytes(current_batch_memory)}")
         logger.debug(f"[MEMORY_AWARE_BATCH] Can add {tensors_to_add} more tensors")
+        logger.debug(f"[MEMORY_AWARE_BATCH] Target batch size: {target_batch_size}")
         logger.debug(f"[MEMORY_AWARE_BATCH] Projected total: {format_bytes(projected_memory)}")
 
-    return max(1, len(current_batch_tensors) + tensors_to_add)
+    return target_batch_size
+pass
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
