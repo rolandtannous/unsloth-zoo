@@ -1219,7 +1219,7 @@ def merge_and_overwrite_lora(
     os.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '600'  # 10 minutes timeout
     os.environ['HF_HUB_DOWNLOAD_MAX_RETRIES'] = '5'
     os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '1'  # Use faster rust-based downloader
-    os.environ['HF_XET_CHUNK_CACHE_SIZE_BYTES'] = str(1024 * 1024 * 1024)
+    #os.environ['HF_XET_CHUNK_CACHE_SIZE_BYTES'] = str(1024 * 1024 * 1024)
     gc.collect()
     if torch.cuda.is_available(): torch.cuda.empty_cache()
     conservative_memory_cleanup("between_operations")
