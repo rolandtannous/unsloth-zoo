@@ -559,9 +559,68 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
             if base_model_is_quantized:
                 if quant_type == "mxfp4":
                     if key.endswith("_blocks"):
-                        # ... existing MXFP4 logic ...
-                        # (keeping this unchanged from your version)
-                        pass
+                       if key.endswith("_blocks"):
+                            if convert_moe_packed_tensors is None:
+                                raise ImportError("MXFP4 dequantization is required, but `convert_moe_packed_tensors` could not be imported.")
+
+                            base_name = key[:-len("_blocks")]
+                            scales_key = base_name + "_scales"
+                            output_key = base_name
+                            if scales_key not in safetensor_keys:
+                                warnings.warn(f"Found mxfp4 tensor {key} but missing its scales tensor {scales_key}. Skipping.")
+                                continue
+
+                            blocks_tensor, scales_tensor = file.get_tensor(key), file.get_tensor(scales_key)
+
+                            if torch.cuda.is_available():
+                                torch.cuda.synchronize()
+                                torch.cuda.empty_cache()
+
+                            device_type, device_id, rows_per_chunk = _choose_mxfp4_processing_strategy(
+                                blocks_tensor, scales_tensor
+                            )
+
+                            if device_type == 'cpu':
+                                try:
+                                    from transformers.integrations.mxfp4 import convert_moe_packed_tensors_cpu
+                                    W = convert_moe_packed_tensors_cpu(
+                                        blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
+                                    ).transpose(1, 2).contiguous()
+                                    if UNSLOTH_ENABLE_LOGGING:
+                                        logger.debug(f"[DEBUG] Using CPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
+                                except ImportError:
+                                    W = convert_moe_packed_tensors(
+                                        blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
+                                    ).transpose(1, 2).contiguous()
+                            else:
+                                W = convert_moe_packed_tensors(
+                                    blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
+                                ).transpose(1, 2).contiguous()
+                                if UNSLOTH_ENABLE_LOGGING:
+                                    logger.debug(f"[DEBUG] Using GPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
+
+                            del blocks_tensor, scales_tensor
+                            processed_mxfp4_keys.add(key)
+                            processed_mxfp4_keys.add(scales_key)
+
+                            lora_stats = converted_lora_weights.get(base_name, None)
+                            if lora_stats and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
+                                if UNSLOTH_ENABLE_LOGGING:
+                                    logger.debug(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING LoRA into Key Group: {base_name}")
+                                count += 1
+                                merge_device = _choose_merge_device(W, lora_stats, output_key)
+                                if UNSLOTH_ENABLE_LOGGING:
+                                    try:
+                                        logger.debug(f"[DEBUG] Merging {output_key} on device '{merge_device}'.")
+                                    except:
+                                        pass
+                                W = _merge_lora(W, lora_stats, output_key, device=merge_device)
+                            else:
+                                if UNSLOTH_ENABLE_LOGGING:
+                                    logger.debug(f"[DEBUG] DEQUANTIZING MXFP4 Key Group: {base_name}")
+                            action_logged = True
+                            detailed_memory_tracking("AFTER_MXFP4_DEQUANT", key)
+                            pass
                     elif key.endswith("_scales"):
                         continue
                     else:
@@ -2775,7 +2834,7 @@ def calculate_memory_aware_batch_size(current_batch_tensors, next_tensor_info_li
             break
 
     # MINIMUM BATCH SIZE: Ensure batches aren't too small
-    min_batch_size = 50  # Force minimum 50 tensors per batch
+    min_batch_size = 100  # Force minimum 50 tensors per batch
     target_batch_size = max(min_batch_size, len(current_batch_tensors) + tensors_to_add)
 
     if UNSLOTH_ENABLE_LOGGING:
