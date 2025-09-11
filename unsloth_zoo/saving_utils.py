@@ -2527,7 +2527,7 @@ def detailed_memory_tracking(stage, key=None, extra_info=None):
             f"RSS={mem_info.rss/(1024**3):.1f}GB, "
             f"VMS={mem_info.vms/(1024**3):.1f}GB, "
             f"Percent={mem_percent:.1f}%, "
-            f"System_Used={(stats['cpu']['available']/(1024**3):.1f}GB ({stats['cpu']['available']/stats['cpu']['total']:.1f}%), "
+            f"System_Used={stats['cpu']['available']/(1024**3):.1f}GB ({stats['cpu']['available']/stats['cpu']['total']:.1f}%), "
             f"{gpu_info}{extra_info}"
         )
 
