@@ -674,7 +674,7 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
                     remaining_tensor_info,
                     converted_lora_weights,
                     output_dtype,
-                    safety_factor=0.90  # Increased
+                    safety_factor=0.85  # Increased
                 )
 
             # Process batch when optimal size reached OR last tensor
@@ -2801,7 +2801,7 @@ pass
 #         logger.debug(f"[MEMORY_AWARE_BATCH] Projected total: {format_bytes(projected_memory)}")
 #
 #     return max(1, len(current_batch_tensors) + tensors_to_add)
-def calculate_memory_aware_batch_size(current_batch_tensors, next_tensor_info_list, converted_lora_weights, output_dtype, safety_factor=0.90):  # Increased from 0.85 to 0.90
+def calculate_memory_aware_batch_size(current_batch_tensors, next_tensor_info_list, converted_lora_weights, output_dtype, safety_factor=0.85):  # Increased from 0.85 to 0.90
     """
     Calculate batch size based on actual memory costs of upcoming tensors
     """
