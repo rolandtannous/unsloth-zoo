@@ -156,12 +156,29 @@ from tqdm import tqdm as ProgressBar
 import os, shutil, re, functools
 
 
-def _merge_lora(W, lora_stats, name):
+# def _merge_lora(W, lora_stats, name):
+#     if lora_stats.lora_A is None or lora_stats.lora_B is None: return W
+#     W = W.to("cuda", dtype = torch.float32, non_blocking = True)
+#     W = W.addmm_(
+#         lora_stats.lora_B.to("cuda", dtype = torch.float32, non_blocking = True),
+#         lora_stats.lora_A.to("cuda", dtype = torch.float32, non_blocking = True),
+#         alpha = lora_stats.alpha,
+#     )
+#     if not torch.isfinite(torch.amax(W)).item():
+#         raise ValueError('Unsloth: Merge failed as there are infinite elements in ' + name)
+#     return W
+# pass
+
+def _merge_lora(W, lora_stats, name, device):
     if lora_stats.lora_A is None or lora_stats.lora_B is None: return W
-    W = W.to("cuda", dtype = torch.float32, non_blocking = True)
+    # Move all tensors to the chosen device for the operation
+    W = W.to(device, dtype = torch.float32, non_blocking = True)
+    lora_B = lora_stats.lora_B.to(device, dtype = torch.float32, non_blocking = True)
+    lora_A = lora_stats.lora_A.to(device, dtype = torch.float32, non_blocking = True)
+
     W = W.addmm_(
-        lora_stats.lora_B.to("cuda", dtype = torch.float32, non_blocking = True),
-        lora_stats.lora_A.to("cuda", dtype = torch.float32, non_blocking = True),
+        lora_B,
+        lora_A,
         alpha = lora_stats.alpha,
     )
     if not torch.isfinite(torch.amax(W)).item():
@@ -257,6 +274,108 @@ def assert_same_keys(model, new_state_dict):
         raise RuntimeError(f"Unsloth: Extracted keys = {difference} do not match!")
     pass
 pass
+
+# @torch.inference_mode
+# def create_lora_statistics(model, merge_into_original = False, return_state_dict = True):
+#     # All Unsloth Zoo code licensed under LGPLv3
+#     # merge_into_original is merging directly into 16bit downloaded model
+#     # without dequantizing
+#     Linear_LoRA_Layers = get_lora_layer_modules()
+#     Linear_LoRA_Layers = tuple(x[0] for x in Linear_LoRA_Layers)
+#
+#     lora_weights = collections.defaultdict(lambda: LoraStats(None, None, None, 0))
+#     module_count, lora_A_count, lora_B_count, scaling_count = 0, 0, 0, 0
+#
+#     remove_keys = set()
+#     keep_keys   = set()
+#
+#     inner_model = find_lora_base_model(model)
+#     for name, module in inner_model.named_modules():
+#         if name == "": continue
+#
+#         elif name.endswith(".lora_A.default"):
+#             lora_weights[name[:-len(".lora_A.default")]].lora_A = module.weight
+#             lora_A_count += 1
+#             expand_module_keys(name, module, remove_keys)
+#
+#         elif name.endswith(".lora_B.default"):
+#             lora_weights[name[:-len(".lora_B.default")]].lora_B = module.weight
+#             lora_B_count += 1
+#             expand_module_keys(name, module, remove_keys)
+#
+#         elif isinstance(module, Linear_LoRA_Layers):
+#             active_adapter = module.active_adapters[0] if \
+#                 hasattr(module, "active_adapters") else module.active_adapter
+#             lora_weights[name].alpha = module.scaling[active_adapter]
+#             scaling_count += 1
+#             expand_module_keys(name, module, remove_keys)
+#
+#         elif name.endswith(".base_layer"):
+#             lora_weights[name[:-len(".base_layer")]].module = module
+#             module_count += 1
+#             remove_keys.add(name)
+#             remove_keys.add(name[:-len(".base_layer")])
+#
+#         elif (not merge_into_original) and check_if_quantized(module):
+#             lora_weights[name].module = module
+#             keep_keys.add(name + ".weight")
+#             if getattr(module, "bias", None) is not None: keep_keys.add(name + ".bias")
+#             expand_module_keys(name, module, remove_keys)
+#             remove_keys.add(name)
+#
+#         elif ".lora_" in name: continue
+#
+#         else:
+#             new_keys = expand_module_keys(name, module, set())
+#             for key in new_keys:
+#                 if not key.endswith((".weight", ".bias")):
+#                     # Check if quantized item exactly which has ".weight"
+#                     if ".weight." in key:
+#                         remove_keys.add(key)
+#                     else:
+#                         # Keep gate_tanh, embedding etc
+#                         pass
+#             remove_keys.add(name)
+#         pass
+#     pass
+#     assert(module_count == lora_A_count == lora_B_count == scaling_count)
+#
+#     # Also return state_dict if needed
+#     state_dict = None
+#     if return_state_dict:
+#         # Memory optimization: process items and remove from old dict to reduce peak memory
+#         old_state_dict = inner_model.state_dict()
+#         state_dict = collections.OrderedDict()
+#
+#         # Get a list of keys to iterate over, so we can delete from the dict
+#         for name in list(old_state_dict.keys()):
+#             param = old_state_dict.pop(name) # Pop to free memory
+#
+#             if name.endswith(".base_layer.weight"):
+#                 name = name[:-len(".base_layer.weight")]
+#
+#             if name in lora_weights:
+#                 state_dict[name + ".weight"]   = lora_weights[name]
+#                 if getattr(lora_weights[name].module, "bias", None) is not None:
+#                     state_dict[name + ".bias"] = lora_weights[name].module.bias
+#                 continue
+#             elif name in keep_keys:
+#                 lora_name = name[:-len(".weight")]
+#                 if lora_name in lora_weights:
+#                     param = lora_weights[lora_name]
+#                 state_dict[name] = param # Keep the param
+#             elif name in remove_keys:
+#                 continue # Skip and free memory
+#             else:
+#                 state_dict[name] = param # Keep the param
+#
+#         del old_state_dict # Ensure it's freed
+#         gc.collect()
+#
+#     if return_state_dict: assert_same_keys(model, state_dict)
+#     return lora_weights, state_dict
+# pass
+
 
 
 @torch.inference_mode
@@ -365,54 +484,90 @@ import time
 
 @torch.inference_mode
 def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dtype, model_class_name, base_model_is_quantized=False, quant_type=None):
-    # All Unsloth Zoo code licensed under LGPLv3
-    # Merges LoRA and overwrites the safetensors file it was merged to
-    filename_original = os.path.join(save_directory, filename)  # Original file path
-    tensors = OrderedDict()
+    filename_original = os.path.join(save_directory, filename)
     count = 0
     import psutil
     import pickle
-    limit = 700 * 1024 * 1024  # 700MB
+
+    # Dynamic batch sizing tracking
+    actual_tensor_sizes = []
+    current_batch_size = 50  # Conservative initial size
+    batch_adjustment_frequency = 25
+    stats = get_memory_stats()
+
+    detailed_memory_tracking("START_DYNAMIC_MERGE", filename, f"Initial batch size: {current_batch_size}")
 
     # Convert lora_weights to safetensor format
     converted_lora_weights = _convert_lora_keys_to_safetensor_format(
         lora_weights, [], model_class_name=model_class_name)
+    detailed_memory_tracking("AFTER_LORA_CONVERSION", filename)
 
-    with safe_open(filename_original, framework="pt", device="cpu") as file:  # Open original file for reading
+    with safe_open(filename_original, framework="pt", device="cpu") as file:
         safetensor_keys = list(file.keys())
+        detailed_memory_tracking("AFTER_FILE_OPEN", filename, f"{len(safetensor_keys)} keys")
 
-        # Update converted_lora_weights with actual safetensor keys
         converted_lora_weights = _convert_lora_keys_to_safetensor_format(
             lora_weights, safetensor_keys, model_class_name=model_class_name)
-
-        # Set to track mxfp4 keys that have already been processed
         processed_mxfp4_keys = set()
 
-        for key in safetensor_keys:
+        # Calculate optimal batch size after sampling a few tensors
+        if len(actual_tensor_sizes) > 10:
+            stats = get_memory_stats()
+            current_batch_size = calculate_dynamic_batch_size(
+                actual_tensor_sizes,
+                stats['cpu']['available']
+            )
+            detailed_memory_tracking("CALCULATED_OPTIMAL_BATCH", None, f"Optimal batch size: {current_batch_size}")
+
+        # TRUE BATCHED PROCESSING
+        current_batch_tensors = OrderedDict()
+        current_batch_memory = 0
+        all_processed_tensors = OrderedDict()
+
+        for idx, key in enumerate(safetensor_keys):
             if key in processed_mxfp4_keys:
                 continue
+
+            # Dynamic batch size adjustment
+            if idx > 0 and idx % batch_adjustment_frequency == 0 and len(actual_tensor_sizes) > 5:
+                stats = get_memory_stats()
+                available_memory = stats['cpu']['available']
+
+                new_batch_size = calculate_dynamic_batch_size(
+                    actual_tensor_sizes,
+                    available_memory
+                )
+
+                if new_batch_size != current_batch_size:
+                    detailed_memory_tracking(f"BATCH_SIZE_ADJUSTED_{idx}", None,
+                                           f"Batch size: {current_batch_size} -> {new_batch_size}")
+                    current_batch_size = new_batch_size
+
+            # Track memory periodically
+            if idx % 50 == 0:
+                detailed_memory_tracking(f"BEFORE_TENSOR_{idx}", key)
+                track_dict_size(current_batch_tensors, f"current_batch_tensors_{idx}")
 
             # FORCE memory cleanup before processing each tensor
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
 
+            W_original = None
             W = None
             output_key = key
             action_logged = False
-            # --- START OF MODIFIED LOGIC ---
 
-            # Case 1: Base model is MXFP4 quantized
+            # [Your existing tensor processing logic - MXFP4 and 16-bit cases]
             if base_model_is_quantized:
                 if quant_type == "mxfp4":
-                    # This block handles ALL keys from a hybrid MXFP4 file.
                     if key.endswith("_blocks"):
                         if convert_moe_packed_tensors is None:
                             raise ImportError("MXFP4 dequantization is required, but `convert_moe_packed_tensors` could not be imported.")
 
                         base_name = key[:-len("_blocks")]
                         scales_key = base_name + "_scales"
-                        output_key = base_name # Correct naming without .weight
+                        output_key = base_name
                         if scales_key not in safetensor_keys:
                             warnings.warn(f"Found mxfp4 tensor {key} but missing its scales tensor {scales_key}. Skipping.")
                             continue
@@ -420,133 +575,463 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
                         blocks_tensor, scales_tensor = file.get_tensor(key), file.get_tensor(scales_key)
 
                         if torch.cuda.is_available():
-                          torch.cuda.synchronize()  # Wait for previous operations to complete
-                          torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                            torch.cuda.empty_cache()
 
-                        # Determine optimal device and chunk size for mxfp4 dequantization
                         device_type, device_id, rows_per_chunk = _choose_mxfp4_processing_strategy(
                             blocks_tensor, scales_tensor
                         )
 
-                        # Apply dequantization with optimal parameters
                         if device_type == 'cpu':
-                            # Use CPU-optimized version
                             try:
                                 from transformers.integrations.mxfp4 import convert_moe_packed_tensors_cpu
                                 W = convert_moe_packed_tensors_cpu(
                                     blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
                                 ).transpose(1, 2).contiguous()
                                 if UNSLOTH_ENABLE_LOGGING:
-                                    logger.info(f"[DEBUG] Using CPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
+                                    logger.debug(f"[DEBUG] Using CPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
                             except ImportError:
-                                # Fallback to original function
                                 W = convert_moe_packed_tensors(
                                     blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
                                 ).transpose(1, 2).contiguous()
                         else:
-                            # Use GPU version (original or patched)
                             W = convert_moe_packed_tensors(
                                 blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
                             ).transpose(1, 2).contiguous()
                             if UNSLOTH_ENABLE_LOGGING:
-                                logger.info(f"[DEBUG] Using GPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
+                                logger.debug(f"[DEBUG] Using GPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
 
-                        processed_mxfp4_keys.add(key); processed_mxfp4_keys.add(scales_key)
+                        del blocks_tensor, scales_tensor
+                        processed_mxfp4_keys.add(key)
+                        processed_mxfp4_keys.add(scales_key)
 
                         lora_stats = converted_lora_weights.get(base_name, None)
                         if lora_stats and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
                             if UNSLOTH_ENABLE_LOGGING:
-                                logger.info(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING LoRA into Key Group: {base_name}")
-                            count += 1; W = _merge_lora(W, lora_stats, output_key)
+                                logger.debug(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING LoRA into Key Group: {base_name}")
+                            count += 1
+                            merge_device = _choose_merge_device(W, lora_stats, output_key)
+                            if UNSLOTH_ENABLE_LOGGING:
+                                try:
+                                    logger.debug(f"[DEBUG] Merging {output_key} on device '{merge_device}'.")
+                                except:
+                                    pass
+                            W = _merge_lora(W, lora_stats, output_key, device=merge_device)
                         else:
                             if UNSLOTH_ENABLE_LOGGING:
-                                logger.info(f"[DEBUG] DEQUANTIZING MXFP4 Key Group: {base_name}")
+                                logger.debug(f"[DEBUG] DEQUANTIZING MXFP4 Key Group: {base_name}")
                         action_logged = True
+                        detailed_memory_tracking("AFTER_MXFP4_DEQUANT", key)
 
                     elif key.endswith("_scales"):
                         continue
-
                     else:
-                        # Handle the 16-bit tensors (like attention layers)
-                        # that are present in the same file as the MXFP4 tensors.
-                        W = file.get_tensor(key)
+                        W_original = file.get_tensor(key)
+                        W = W_original
+                        detailed_memory_tracking("AFTER_TENSOR_LOAD", key)
+            else:
+                W_original = file.get_tensor(key)
+                W = W_original
+                detailed_memory_tracking("AFTER_TENSOR_LOAD", key)
 
-            else: # This is the general case for a purely 16-bit base model.
-                W = file.get_tensor(key)
-            # Remove .weight suffix to match LoRA key format
+            # LoRA merging logic
             lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
             lora_stats = converted_lora_weights.get(lora_key, None)
 
             if W is not None and lora_stats is not None and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
                 if not action_logged:
                     count += 1
-                    W = _merge_lora(W, lora_stats, output_key)  # Assume _merge_lora is defined elsewhere
-                    action_logged=True
+                    merge_device = _choose_merge_device(W, lora_stats, output_key)
+                    if UNSLOTH_ENABLE_LOGGING:
+                        try:
+                            logger.debug(f"[DEBUG] Merging {output_key} on device '{merge_device}'.")
+                        except:
+                            pass
+                    W = _merge_lora(W, lora_stats, output_key, device=merge_device)
+                    detailed_memory_tracking("AFTER_LORA_MERGE", key)
+                    action_logged = True
 
             if W is None:
                 continue
 
-            with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as temp_file:
-                temp_filename = temp_file.name
-                # Save the merged tensor to a unique temp file
-                torch.save(W.to(output_dtype), temp_filename, pickle_module=pickle, pickle_protocol=pickle.HIGHEST_PROTOCOL)
-                # Load it back as a memory-mapped object. The OS will manage paging this from disk.
-                W = torch.load(temp_filename, map_location="cpu", mmap=True, weights_only=False)
+            # ACTUAL BATCHED PROCESSING: Add to batch instead of immediate temp file
+            tensor_memory_cost = calculate_tensor_memory_cost(W, lora_stats, output_dtype)
+            actual_tensor_sizes.append(tensor_memory_cost)
 
-                # Clean up the temporary pickle file immediately after mmaping
-            try:
-                os.remove(temp_filename)
-            except OSError:
-                # On Windows, the mmap might keep a handle. The OS will clean it up.
-                pass
+            # Keep only recent history
+            if len(actual_tensor_sizes) > 200:
+                actual_tensor_sizes = actual_tensor_sizes[-100:]
 
-            tensors[output_key] = W
+            if W_original is not None and W is not W_original:
+                del W_original
 
-            # Free up VRAM after each merge
-            torch.cuda.empty_cache()
+            # Add to current batch
+            current_batch_tensors[output_key] = W.to(output_dtype)
+            current_batch_memory += tensor_memory_cost
 
-    # CRITICAL: Force cleanup to release file handles on Windows
-    if os.name == 'nt':
-        gc.collect()
-        time.sleep(0.1)  # Give Windows a moment to release file handles
+            # Clean up local reference
+            del W
 
-    # Create a temporary file in the same directory for atomic rename
-    with tempfile.NamedTemporaryFile(suffix=".safetensors", dir=save_directory, delete=False) as tmpfile:
-        temp_filename_safetensors = tmpfile.name
+            # Process batch when full OR last tensor
+            should_process_batch = (
+                len(current_batch_tensors) >= current_batch_size or
+                idx == len(safetensor_keys) - 1 or
+                current_batch_memory > stats['cpu']['available'] * 0.6  # Safety check
+            )
 
-    save_file(tensors, temp_filename_safetensors, metadata={"format": "pt"})  # Save to the temporary safetensors file
+            if should_process_batch:
+                detailed_memory_tracking(f"PROCESSING_BATCH_{idx}", None,
+                                       f"Batch size: {len(current_batch_tensors)}, Memory: {format_bytes(current_batch_memory)}")
 
-    # Replace the temporary file with the original file
-    try:
-        os.replace(temp_filename_safetensors, filename_original)  # Attempt atomic rename
-    except OSError as e:
-        # If rename fails (e.g., due to permissions), fall back to copy and remove temporary file
-        print(f"Error renaming temporary file: {e}. Attempting copy and replace.")
-        import shutil
+                # Create memory-mapped versions for final dict
+                batch_temp_file = tempfile.NamedTemporaryFile(
+                    suffix=f"_batch_{idx//current_batch_size:03d}.safetensors",
+                    dir=save_directory,
+                    delete=False
+                )
+                batch_temp_path = batch_temp_file.name
+                batch_temp_file.close()
 
-        # On Windows, we might still have the file locking issue with copy
-        if os.name == 'nt':
-            # Try a few times with delays
-            for attempt in range(3):
+                # Save entire batch at once (much more efficient I/O)
+                save_file(current_batch_tensors, batch_temp_path, metadata={"format": "pt"})
+
+                detailed_memory_tracking(f"BATCH_SAVED_{idx}", None, f"Saved {len(current_batch_tensors)} tensors")
+
+                # Load back as memory-mapped for final collection
+                with safe_open(batch_temp_path, framework="pt", device="cpu") as batch_file:
+                    for batch_key in batch_file.keys():
+                        # Memory-mapped tensor
+                        all_processed_tensors[batch_key] = batch_file.get_tensor(batch_key)
+
+                # Clean up
+                current_batch_tensors.clear()
+                current_batch_memory = 0
+
+                # Remove temp batch file
                 try:
-                    shutil.copy2(temp_filename_safetensors, filename_original)
-                    break
-                except PermissionError:
-                    if attempt == 2:  # Last attempt
-                        raise
-                    time.sleep(0.5)
-                    gc.collect()
-        else:
-            shutil.copy2(temp_filename_safetensors, filename_original)
+                    os.remove(batch_temp_path)
+                except:
+                    pass
 
-        # Clean up temp file
-        try:
-            os.remove(temp_filename_safetensors)
-        except:
-            pass
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
+                detailed_memory_tracking(f"AFTER_BATCH_CLEANUP_{idx}", None)
+
+            # Less frequent garbage collection since we're batching
+            if (idx + 1) % 100 == 0:
+                gc.collect()
+
+    detailed_memory_tracking("AFTER_PROCESSING_COMPLETE", filename, f"Total processed tensors: {len(all_processed_tensors)}")
+
+    # Final save (all tensors are already memory-mapped)
+    with tempfile.NamedTemporaryFile(suffix=".safetensors", dir=save_directory, delete=False) as final_temp:
+        final_temp_path = final_temp.name
+
+    save_file(all_processed_tensors, final_temp_path, metadata={"format": "pt"})
+    detailed_memory_tracking("AFTER_FINAL_SAVE", filename)
+
+    del all_processed_tensors
+    gc.collect()
+    detailed_memory_tracking("AFTER_FINAL_CLEANUP", filename)
+
+    # Replace original file
+    os.replace(final_temp_path, filename_original)
     return count
 pass
+
+# @torch.inference_mode
+# def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dtype, model_class_name, base_model_is_quantized=False, quant_type=None):
+#     filename_original = os.path.join(save_directory, filename)
+#     count = 0
+#     import psutil
+#     import pickle
+#
+#     # Dynamic batch sizing tracking
+#     actual_tensor_sizes = []  # Track actual memory consumption
+#     current_batch_size = 20  # Conservative initial size
+#     batch_adjustment_frequency = 25  # Adjust batch size every N tensors
+#
+#     detailed_memory_tracking("START_DYNAMIC_MERGE", filename, f"Initial batch size: {current_batch_size}")
+#
+#     # Convert lora_weights to safetensor format
+#     converted_lora_weights = _convert_lora_keys_to_safetensor_format(
+#         lora_weights, [], model_class_name=model_class_name)
+#     detailed_memory_tracking("AFTER_LORA_CONVERSION", filename)
+#
+#     temp_processed_tensors = []
+#
+#     with safe_open(filename_original, framework="pt", device="cpu") as file:
+#         safetensor_keys = list(file.keys())
+#         detailed_memory_tracking("AFTER_FILE_OPEN", filename, f"{len(safetensor_keys)} keys")
+#
+#         converted_lora_weights = _convert_lora_keys_to_safetensor_format(
+#             lora_weights, safetensor_keys, model_class_name=model_class_name)
+#         processed_mxfp4_keys = set()
+#
+#         for idx, key in enumerate(safetensor_keys):
+#             if key in processed_mxfp4_keys:
+#                 continue
+#
+#             # Dynamic batch size adjustment
+#             if idx > 0 and idx % batch_adjustment_frequency == 0:
+#                 stats = get_memory_stats()
+#                 available_memory = stats['cpu']['available']
+#
+#                 new_batch_size = calculate_dynamic_batch_size(
+#                     actual_tensor_sizes,
+#                     available_memory
+#                 )
+#
+#                 if new_batch_size != current_batch_size:
+#                     detailed_memory_tracking(f"BATCH_SIZE_ADJUSTED_{idx}", None,
+#                                            f"Batch size: {current_batch_size} -> {new_batch_size}")
+#                     current_batch_size = new_batch_size
+#
+#             # Track memory periodically
+#             if idx % 20 == 0:
+#                 detailed_memory_tracking(f"BEFORE_TENSOR_{idx}", key)
+#
+#             # FORCE memory cleanup before processing each tensor
+#             if torch.cuda.is_available():
+#                 torch.cuda.empty_cache()
+#                 torch.cuda.synchronize()
+#
+#             W_original = None
+#             W = None
+#             output_key = key
+#             action_logged = False
+#
+#             # [Your existing tensor processing logic - MXFP4 and 16-bit cases]
+#             if base_model_is_quantized:
+#                 if quant_type == "mxfp4":
+#                     if key.endswith("_blocks"):
+#                         if convert_moe_packed_tensors is None:
+#                             raise ImportError("MXFP4 dequantization is required, but `convert_moe_packed_tensors` could not be imported.")
+#
+#                         base_name = key[:-len("_blocks")]
+#                         scales_key = base_name + "_scales"
+#                         output_key = base_name
+#                         if scales_key not in safetensor_keys:
+#                             warnings.warn(f"Found mxfp4 tensor {key} but missing its scales tensor {scales_key}. Skipping.")
+#                             continue
+#
+#                         blocks_tensor, scales_tensor = file.get_tensor(key), file.get_tensor(scales_key)
+#
+#                         if torch.cuda.is_available():
+#                             torch.cuda.synchronize()
+#                             torch.cuda.empty_cache()
+#
+#                         device_type, device_id, rows_per_chunk = _choose_mxfp4_processing_strategy(
+#                             blocks_tensor, scales_tensor
+#                         )
+#
+#                         if device_type == 'cpu':
+#                             try:
+#                                 from transformers.integrations.mxfp4 import convert_moe_packed_tensors_cpu
+#                                 W = convert_moe_packed_tensors_cpu(
+#                                     blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
+#                                 ).transpose(1, 2).contiguous()
+#                                 if UNSLOTH_ENABLE_LOGGING:
+#                                     logger.debug(f"[DEBUG] Using CPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
+#                             except ImportError:
+#                                 W = convert_moe_packed_tensors(
+#                                     blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
+#                                 ).transpose(1, 2).contiguous()
+#                         else:
+#                             W = convert_moe_packed_tensors(
+#                                 blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
+#                             ).transpose(1, 2).contiguous()
+#                             if UNSLOTH_ENABLE_LOGGING:
+#                                 logger.debug(f"[DEBUG] Using GPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
+#
+#                         del blocks_tensor, scales_tensor
+#                         processed_mxfp4_keys.add(key)
+#                         processed_mxfp4_keys.add(scales_key)
+#
+#                         lora_stats = converted_lora_weights.get(base_name, None)
+#                         if lora_stats and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
+#                             if UNSLOTH_ENABLE_LOGGING:
+#                                 logger.debug(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING LoRA into Key Group: {base_name}")
+#                             count += 1
+#                             merge_device = _choose_merge_device(W, lora_stats, output_key)
+#                             if UNSLOTH_ENABLE_LOGGING:
+#                                 try:
+#                                     logger.debug(f"[DEBUG] Merging {output_key} on device '{merge_device}'.")
+#                                 except:
+#                                     pass
+#                             W = _merge_lora(W, lora_stats, output_key, device=merge_device)
+#                         else:
+#                             if UNSLOTH_ENABLE_LOGGING:
+#                                 logger.debug(f"[DEBUG] DEQUANTIZING MXFP4 Key Group: {base_name}")
+#                         action_logged = True
+#                         detailed_memory_tracking("AFTER_MXFP4_DEQUANT", key)
+#
+#                     elif key.endswith("_scales"):
+#                         continue
+#                     else:
+#                         W_original = file.get_tensor(key)
+#                         W = W_original
+#                         detailed_memory_tracking("AFTER_TENSOR_LOAD", key)
+#             else:
+#                 W_original = file.get_tensor(key)
+#                 W = W_original
+#                 detailed_memory_tracking("AFTER_TENSOR_LOAD", key)
+#
+#             # LoRA merging logic
+#             lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
+#             lora_stats = converted_lora_weights.get(lora_key, None)
+#
+#             if W is not None and lora_stats is not None and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
+#                 if not action_logged:
+#                     count += 1
+#                     merge_device = _choose_merge_device(W, lora_stats, output_key)
+#                     if UNSLOTH_ENABLE_LOGGING:
+#                         try:
+#                             logger.debug(f"[DEBUG] Merging {output_key} on device '{merge_device}'.")
+#                         except:
+#                             pass
+#                     W = _merge_lora(W, lora_stats, output_key, device=merge_device)
+#                     detailed_memory_tracking("AFTER_LORA_MERGE", key)
+#                     action_logged = True
+#
+#             if W is None:
+#                 continue
+#
+#             # DYNAMIC MEMORY TRACKING: Calculate actual memory cost of this tensor
+#             tensor_memory_cost = calculate_tensor_memory_cost(W, lora_stats, output_dtype)
+#             actual_tensor_sizes.append(tensor_memory_cost)
+#
+#             # Keep only recent history to avoid memory growth
+#             if len(actual_tensor_sizes) > 200:
+#                 actual_tensor_sizes = actual_tensor_sizes[-100:]  # Keep last 100 measurements
+#
+#             if W_original is not None and W is not W_original:
+#                 del W_original
+#                 detailed_memory_tracking("AFTER_DEL_ORIGINAL", key)
+#
+#             # Save each tensor to individual temp file immediately
+#             tensor_temp_file = tempfile.NamedTemporaryFile(
+#                 suffix=f"_{idx:04d}.pt",
+#                 dir=save_directory,
+#                 delete=False
+#             )
+#             tensor_temp_path = tensor_temp_file.name
+#             tensor_temp_file.close()
+#
+#             torch.save(W.to(output_dtype), tensor_temp_path, pickle_module=pickle, pickle_protocol=pickle.HIGHEST_PROTOCOL)
+#             temp_processed_tensors.append((output_key, tensor_temp_path))
+#
+#             detailed_memory_tracking("AFTER_TENSOR_TEMP_SAVE", key)
+#
+#             # Immediate cleanup
+#             del W
+#             gc.collect()
+#             if torch.cuda.is_available():
+#                 torch.cuda.empty_cache()
+#
+#             # More frequent garbage collection
+#             if (idx + 1) % 10 == 0:
+#                 gc.collect()
+#                 detailed_memory_tracking(f"AFTER_GC_CYCLE_{idx+1}", None)
+#
+#     detailed_memory_tracking("AFTER_PROCESSING_COMPLETE", filename, f"Total temp tensors: {len(temp_processed_tensors)}")
+#
+#     # STREAMING COMBINATION with dynamically calculated final batch size
+#     stats = get_memory_stats()
+#     final_batch_size = calculate_dynamic_batch_size(actual_tensor_sizes, stats['cpu']['available'])
+#     detailed_memory_tracking("FINAL_BATCH_SIZE", None, f"Final batch size: {final_batch_size}")
+#
+#     final_tensors = OrderedDict()
+#     final_temp_file = tempfile.NamedTemporaryFile(suffix=".safetensors", dir=save_directory, delete=False)
+#     final_temp_path = final_temp_file.name
+#     final_temp_file.close()
+#
+#     try:
+#         batch_count = 0
+#         for i, (tensor_key, tensor_temp_path) in enumerate(temp_processed_tensors):
+#             # Load tensor as memory-mapped
+#             tensor_data = torch.load(tensor_temp_path, map_location="cpu", mmap=True, weights_only=False)
+#             final_tensors[tensor_key] = tensor_data
+#
+#             # Clean up individual temp file immediately
+#             try:
+#                 os.remove(tensor_temp_path)
+#             except:
+#                 pass
+#
+#             # Save in dynamically calculated batches
+#             if len(final_tensors) >= final_batch_size or i == len(temp_processed_tensors) - 1:
+#                 detailed_memory_tracking(f"SAVING_BATCH_{batch_count}", None, f"Batch size: {len(final_tensors)}")
+#
+#                 if batch_count == 0:
+#                     # First batch - create the file
+#                     save_file(final_tensors, final_temp_path, metadata={"format": "pt"})
+#                 else:
+#                     # Subsequent batches - merge with existing file
+#                     existing_tensors = OrderedDict()
+#                     with safe_open(final_temp_path, framework="pt", device="cpu") as existing_file:
+#                         for existing_key in existing_file.keys():
+#                             existing_tensors[existing_key] = existing_file.get_tensor(existing_key)
+#
+#                     # Combine existing + new batch
+#                     existing_tensors.update(final_tensors)
+#                     save_file(existing_tensors, final_temp_path, metadata={"format": "pt"})
+#                     del existing_tensors
+#
+#                 # Clear current batch
+#                 final_tensors.clear()
+#                 batch_count += 1
+#                 gc.collect()
+#                 if torch.cuda.is_available():
+#                     torch.cuda.empty_cache()
+#
+#                 detailed_memory_tracking(f"AFTER_BATCH_{batch_count-1}", None)
+#
+#     except Exception as e:
+#         # Clean up all temp files on error
+#         for _, tensor_temp_path in temp_processed_tensors:
+#             try:
+#                 os.remove(tensor_temp_path)
+#             except:
+#                 pass
+#         try:
+#             os.remove(final_temp_path)
+#         except:
+#             pass
+#         raise e
+#
+#     detailed_memory_tracking("BEFORE_FINAL_REPLACE", filename)
+#
+#     # Replace original file
+#     try:
+#         os.replace(final_temp_path, filename_original)
+#     except OSError as e:
+#         print(f"Error renaming temporary file: {e}. Attempting copy and replace.")
+#         import shutil
+#
+#         if os.name == 'nt':
+#             for attempt in range(3):
+#                 try:
+#                     shutil.copy2(final_temp_path, filename_original)
+#                     break
+#                 except PermissionError:
+#                     if attempt == 2:
+#                         raise
+#                     time.sleep(0.5)
+#                     gc.collect()
+#         else:
+#             shutil.copy2(final_temp_path, filename_original)
+#
+#         try:
+#             os.remove(final_temp_path)
+#         except:
+#             pass
+#
+#     detailed_memory_tracking("AFTER_FINAL_REPLACE", filename)
+#     return count
+# pass
 from huggingface_hub import (
     split_state_dict_into_shards_factory,
     get_torch_storage_size,
@@ -726,6 +1211,13 @@ def merge_and_overwrite_lora(
     use_temp_file        = False,
     cleanup_temp_file    = True,
 ):
+    import os
+    os.environ['HF_XET_CHUNK_CACHE_SIZE_BYTES']='0'
+    os.environ['HF_HUB_DISABLE_XET']="1"
+    gc.collect()
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
+    conservative_memory_cleanup("between_operations")
+    detailed_memory_tracking("MERGE_START", "Initial state")
     # All Unsloth Zoo code licensed under LGPLv3
     # Directly downloads 16bit original weights and merges LoRA
     inner_model = model.base_model.model if isinstance(model, PeftModel) else model
@@ -745,12 +1237,14 @@ def merge_and_overwrite_lora(
     safetensors_list = []
     max_size_in_bytes = 0
     total_size_in_bytes = 0
+    config = model.config
 
     # Handle case for local model where config._name_or_path is a local os path
     # https://github.com/unslothai/unsloth/issues/2140
     is_local_path = False
     if os.path.exists(model_name) and os.path.isdir(model_name):
         is_local_path = True
+        detailed_memory_tracking("LOCAL_MODEL_DETECTED", f"Path: {model_name}")
         print(f"Detected local model directory: {model_name}")
 
         # Get safetensors files from local directory
@@ -765,6 +1259,7 @@ def merge_and_overwrite_lora(
         # Check for index file
         index_path = os.path.join(model_name, "model.safetensors.index.json")
         if os.path.exists(index_path):
+            detailed_memory_tracking("LOCAL_INDEX_PROCESSING", f"Index file: {index_path}")
             try:
                 with open(index_path, 'r', encoding = "utf-8") as f:
                     index_data = json.load(f)
@@ -782,19 +1277,25 @@ def merge_and_overwrite_lora(
                                     file_size = os.path.getsize(file_path)
                                     max_size_in_bytes = max(max_size_in_bytes, file_size)
                                     total_size_in_bytes += file_size
+                detailed_memory_tracking("AFTER_LOCAL_INDEX_PROCESSING", None)
             except Exception as e:
                 print(f"Warning: Could not process index file: {e}")
     else:
         # Original HF repo logic
+        detailed_memory_tracking("BEFORE_HF_FILE_LIST", f"Fetching file list for {model_name}")
         try:
             file_list = HfFileSystem(token = token).ls(model_name, detail = True)
+            detailed_memory_tracking("AFTER_HF_FILE_LIST", f"Retrieved {len(file_list) if file_list else 0} files")
         except:
+            detailed_memory_tracking("HF_FILE_LIST_ERROR", f"Error: {str(e)}")
             original_model_id = get_original_model_id(model_name)
             model_name = original_model_id
             if original_model_id is None:
                 raise ValueError(f"Could not determine original model ID from {model_name}. "
                                 "If using a local model, ensure the path exists and contains safetensors files.")
+            detailed_memory_tracking("BEFORE_HF_FILE_LIST_RETRY", f"Retrying with {model_name}")
             file_list = HfFileSystem(token = token).ls(model_name, detail = True)
+            detailed_memory_tracking("AFTER_HF_FILE_LIST_RETRY", f"Retrieved {len(file_list) if file_list else 0} files")
 
         # Process HF file listing
         for x in file_list:
@@ -802,6 +1303,7 @@ def merge_and_overwrite_lora(
             safetensors_list.append(os.path.split(x["name"])[-1])
             max_size_in_bytes = max(max_size_in_bytes, x["size"])
             total_size_in_bytes += x["size"]
+    detailed_memory_tracking("AFTER_SAFETENSORS_LIST", f"{len(safetensors_list)} files, {format_bytes(total_size_in_bytes)} total")
 
     if not safetensors_list:
          raise RuntimeError(f"No '.safetensors' files found for the base model: {model_name}")
@@ -826,6 +1328,7 @@ def merge_and_overwrite_lora(
         min_size_in_bytes = max_size_in_bytes,
         use_temp_file = use_temp_file,
     )
+    detailed_memory_tracking("AFTER_PREPARE_SAVING", None)
     use_temp_file = use_temp_file or new_use_temp_file
     _save_dir_path = Path(save_directory)
 
@@ -844,7 +1347,10 @@ def merge_and_overwrite_lora(
     pass
 
     # Save config / generation_config via no state_dict and tokenizer
-    if tokenizer is not None: tokenizer.save_pretrained(save_directory = save_directory,)
+    if tokenizer is not None:
+        detailed_memory_tracking("BEFORE_TOKENIZER_SAVE", None)
+        tokenizer.save_pretrained(save_directory = save_directory,)
+        detailed_memory_tracking("AFTER_TOKENIZER_SAVE", None)
 
     # --- Handle 4-bit merging first ---
     if save_method == "merged_4bit" or save_method == "forced_merged_4bit":
@@ -896,19 +1402,27 @@ def merge_and_overwrite_lora(
     # Default handle 16 bit merge and save/push
     # Step 1: Save base model config/architecture (no weights needed here)
     if save_method == "merged_16bit":
-        config_model = find_lora_base_model(model) if isinstance(model, PeftModel) else model
-        config_model.save_pretrained(
-            save_directory = save_directory,
-            state_dict = {},
-        )
-        # Remove any weight files that shouldn't have been saved (transformers 4.56.0 bug)
-        import glob
-        weight_files = glob.glob(os.path.join(save_directory, "*.bin")) + \
-                       glob.glob(os.path.join(save_directory, "*.safetensors"))
-
-        for weight_file in weight_files:
-            os.remove(weight_file)
-            print(f"DEBUG: Removed incorrectly saved weight file: {os.path.basename(weight_file)}")
+        detailed_memory_tracking("BEFORE_CONFIG_SAVE", None)
+        # config_model = find_lora_base_model(model) if isinstance(model, PeftModel) else model
+        # config_model.save_pretrained(
+        #     save_directory = save_directory,
+        #     state_dict = {},
+        # )
+        # # Remove any weight files that shouldn't have been saved (transformers 4.56.0 bug)
+        # import glob
+        # weight_files = glob.glob(os.path.join(save_directory, "*.bin")) + \
+        #                glob.glob(os.path.join(save_directory, "*.safetensors"))
+        #
+        # for weight_file in weight_files:
+        #     os.remove(weight_file)
+        #     if UNSLOTH_ENABLE_LOGGING:
+        #         logger.debug(f"DEBUG: Removed incorrectly saved weight file: {os.path.basename(weight_file)}")
+        #from transformers import AutoConfig
+        #base_config = AutoConfig.from_pretrained(final_model_name)
+        #base_config.save_pretrained(save_directory)
+        config.save_pretrained(save_directory)
+        detailed_memory_tracking("AFTER_CONFIG_SAVE", None)
+        if tokenizer is not None: tokenizer.save_pretrained(save_directory)
 
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         # Remove the quantization_config in the config.json file if it exists,
@@ -916,7 +1430,9 @@ def merge_and_overwrite_lora(
 
     # Step 2: Initial upload of non-model files (config, tokenizer)
     if push_to_hub:
+        detailed_memory_tracking("BEFORE_INITIAL_UPLOAD", None)
         upload_items()
+        detailed_memory_tracking("AFTER_INITIAL_UPLOAD", None)
 
 
     # Step 3: Conditional index handling
@@ -927,21 +1443,27 @@ def merge_and_overwrite_lora(
     # ONLY download/copy the original index if we are NOT dequantizing an MXFP4 model
     if not (base_model_is_quantized and quant_type == "mxfp4"):
         if is_local_path:
+            detailed_memory_tracking("BEFORE_LOCAL_INDEX_COPY", None)
             os.makedirs(save_directory, exist_ok=True)
             # Copy from local
             if safe_tensor_index_files:
                 local_index_path = os.path.join(model_name, "model.safetensors.index.json")
                 if os.path.exists(local_index_path):
                     shutil.copy2(local_index_path, os.path.join(save_directory, "model.safetensors.index.json"))
+                    gc.collect()
+            detailed_memory_tracking("AFTER_LOCAL_INDEX_COPY", None)
         else:
             # Download from HF
             if "model.safetensors.index.json" in [f for f in safe_tensor_index_files]:
+                detailed_memory_tracking("BEFORE_INDEX_DOWNLOAD", f"Downloading index file")
                 snapshot_download(repo_id=model_name, local_dir=save_directory, allow_patterns=["model.safetensors.index.json"])
+                detailed_memory_tracking("AFTER_INDEX_DOWNLOAD", f"Index file downloaded")
 
         if push_to_hub and safe_tensor_index_files:
             upload_items("model.safetensors.index.json")
         pass
 
+    detailed_memory_tracking("BEFORE_CACHE_CHECK", f"Checking cache for {len(safetensors_list)} files")
     # Step 4 : Handle retrieval of original 16-bit shards
     if not is_local_path and _hf_cache_dir is not None:
         copied_all_from_cache = _try_copy_all_from_cache(
@@ -951,6 +1473,7 @@ def merge_and_overwrite_lora(
             hf_cache_dir=_hf_cache_dir,
             token=token,
         )
+        detailed_memory_tracking("AFTER_CACHE_CHECK", f"Copied from cache: {copied_all_from_cache}")
 
     if not copied_all_from_cache and not low_disk_space_usage and not is_local_path:
         print(f"Downloading safetensors for {model_name}...")
@@ -959,28 +1482,37 @@ def merge_and_overwrite_lora(
             local_dir = save_directory,
             allow_patterns = safe_tensor_index_files + safetensors_list,
         )
+        detailed_memory_tracking("AFTER_SNAPSHOT_DOWNLOAD", f"Downloaded {len(safetensors_list)} files")
 
 
     # Step 5: Iterate through original shards, merge LoRA, and overwrite/save
     for filename in ProgressBar(safetensors_list, desc = "Unsloth: Merging weights into 16bit"):
         file_path = os.path.join(save_directory, filename)
+        detailed_memory_tracking("BEFORE_SHARD_PROCESS", f"Processing {filename}")
         # Only download if we didn't get everything from cache AND this specific file doesn't exist
         # AND we're in low disk space mode
         # For local models, copy the file if needed
         if is_local_path and not os.path.exists(file_path):
+            detailed_memory_tracking("BEFORE_LOCAL_COPY", f"Copying {filename}")
             local_file_path = os.path.join(model_name, filename)
             if os.path.exists(local_file_path):
                 shutil.copy2(local_file_path, file_path)
                 print(f"Copied {filename} from local model directory")
+                gc.collect()
+            detailed_memory_tracking("AFTER_LOCAL_COPY", f"Copied {filename}")
+
 
         elif not copied_all_from_cache and low_disk_space_usage and not os.path.exists(file_path) and not is_local_path:
+            detailed_memory_tracking("BEFORE_INDIVIDUAL_DOWNLOAD", f"Downloading {filename}")
             hf_hub_download(
                 repo_id = model_name,
                 filename = filename,
                 repo_type = "model",
                 local_dir = save_directory,
             )
+            detailed_memory_tracking("AFTER_INDIVIDUAL_DOWNLOAD", f"Downloaded {filename}")
         pass
+        detailed_memory_tracking("BEFORE_MERGE_OPERATION", f"Starting merge for {filename}")
         n_saved_modules += _merge_and_overwrite_lora(
             save_directory = save_directory,
             filename = filename,
@@ -990,10 +1522,15 @@ def merge_and_overwrite_lora(
             base_model_is_quantized = base_model_is_quantized,
             quant_type=quant_type,
         )
+        detailed_memory_tracking("AFTER_MERGE_OPERATION", f"Completed merge for {filename}")
+        gc.collect()
         torch.cuda.empty_cache()
+        detailed_memory_tracking("AFTER_SHARD_CLEANUP", f"Cleaned up after {filename}")
         if low_disk_space_usage and push_to_hub:
+            detailed_memory_tracking("BEFORE_SHARD_UPLOAD", f"Uploading {filename}")
             upload_items(filename)
             os.remove(os.path.join(save_directory, filename)) # Remove to conserve disk space
+            detailed_memory_tracking("AFTER_SHARD_UPLOAD", f"Uploaded and removed {filename}")
         pass
     pass
 
@@ -1048,7 +1585,10 @@ def merge_and_overwrite_lora(
         except Exception as e:
             print(f"Warning: Failed to remove temporary directory {save_directory}: {e}")
     pass
+    gc.collect()
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
 
+    detailed_memory_tracking("MERGE_COMPLETE", "Merge process finished")
     return save_directory
 pass
 
@@ -1836,7 +2376,7 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
         best = suitable_strategies[0]
 
         if UNSLOTH_ENABLE_LOGGING:
-            logger.info(
+            logger.debug(
                 f"[MXFP4] Selected {best['device_type']}:{best['device_id'] or ''} "
                 f"with {best['rows_per_chunk']:,} rows per chunk "
                 f"(safety factor: {best['safety_factor']:.0%}, "
@@ -1888,6 +2428,314 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
     )
 
     return (best_fallback['device_type'], best_fallback['device_id'], fallback_chunk_size)
+pass
+
+def _choose_merge_device(W, lora_stats, key):
+    """
+    Chooses the optimal device (CPU or GPU) to perform a LoRA merge based on memory requirements.
+    """
+    if not torch.cuda.is_available():
+        return "cpu"
+
+    lora_A = lora_stats.lora_A
+    lora_B = lora_stats.lora_B
+    if lora_A is None or lora_B is None:
+        return W.device if isinstance(W, torch.Tensor) else "cpu"
+
+    # Memory cost is for the float32 versions of the matrices
+    memory_cost = (W.numel() + lora_A.numel() + lora_B.numel()) * 4 # 4 bytes for float32
+
+    stats = get_memory_stats()
+    chosen_device = None
+
+    # Device-specific safety factors
+    GPU_SAFETY_FACTOR = 0.80  # Leave 20% free VRAM
+    CPU_SAFETY_FACTOR = 0.75  # Leave 25% free RAM
+
+    def calculate_safe_usable_memory(free_memory, safety_factor):
+        return free_memory * safety_factor
+
+    # Check GPU VRAM first
+    if stats['gpus']:
+        gpu_safe_usable_memory = calculate_safe_usable_memory(
+            free_memory=stats['gpus'][0]['free'],
+            safety_factor=GPU_SAFETY_FACTOR,
+        )
+        if gpu_safe_usable_memory > memory_cost:
+            chosen_device = "cuda"
+
+    # Check CPU RAM as a fallback if GPU is not chosen
+    if chosen_device is None:
+        cpu_safe_usable_memory = calculate_safe_usable_memory(
+            free_memory=stats['cpu']['available'],
+            safety_factor=CPU_SAFETY_FACTOR,
+        )
+        if cpu_safe_usable_memory > memory_cost:
+            warnings.warn(
+                f"Unsloth: Not enough VRAM to merge LoRA layers for '{key}'. "
+                f"Required: {format_bytes(memory_cost)}. Merging on CPU. This will be slower."
+            )
+            chosen_device = "cpu"
+
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.debug(
+            f"[DEBUG] Merge stats for '{key}': "
+            f"Cost = {format_bytes(memory_cost)}. "
+            f"Chosen device = '{chosen_device}'."
+        )
+
+    # If neither has enough memory, raise an error
+    if chosen_device is None:
+        raise RuntimeError(
+            f"Unsloth: Not enough memory to merge LoRA layer '{key}' ({W.shape}).\n"
+            f"Required memory: {format_bytes(memory_cost)}.\n"
+            f"Available VRAM (safe): {format_bytes(gpu_safe_usable_memory)}.\n"
+            f"Available RAM (safe): {format_bytes(cpu_safe_usable_memory)}."
+        )
+
+    return chosen_device
+pass
+
+def detailed_memory_tracking(stage, key=None, extra_info=None):
+    """Detailed memory tracking with breakdown"""
+    import psutil
+    import os
+
+    # Get current process
+    process = psutil.Process(os.getpid())
+
+    # Memory info
+    mem_info = process.memory_info()
+    mem_percent = process.memory_percent()
+
+    # System memory
+    system_mem = psutil.virtual_memory()
+
+    # GPU memory if available
+    gpu_info = ""
+    if torch.cuda.is_available():
+        gpu_mem = torch.cuda.mem_get_info(0)
+        gpu_free_gb = gpu_mem[0] / (1024**3)
+        gpu_used_gb = (gpu_mem[1] - gpu_mem[0]) / (1024**3)
+        gpu_info = f"GPU: {gpu_used_gb:.1f}GB used, {gpu_free_gb:.1f}GB free"
+
+    key_info = f" [{key}]" if key else ""
+    extra_info = f" - {extra_info}" if extra_info else ""
+
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.debug(
+            f"[MEMORY] {stage}{key_info}: "
+            f"RSS={mem_info.rss/(1024**3):.1f}GB, "
+            f"VMS={mem_info.vms/(1024**3):.1f}GB, "
+            f"Percent={mem_percent:.1f}%, "
+            f"System_Used={system_mem.used/(1024**3):.1f}GB ({system_mem.percent:.1f}%), "
+            f"{gpu_info}{extra_info}"
+        )
+
+def track_dict_size(tensors_dict, stage):
+    """Track the actual memory footprint of the tensors dictionary"""
+    if not tensors_dict:
+        return
+
+    total_elements = sum(t.numel() if hasattr(t, 'numel') else 0 for t in tensors_dict.values())
+    dict_size_gb = total_elements * 2 / (1024**3)  # Assuming float16
+    num_tensors = len(tensors_dict)
+
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.debug(f"[DICT_SIZE] {stage}: {num_tensors} tensors, ~{dict_size_gb:.1f}GB total")
+pass
+
+def calculate_optimal_batch_size(safetensor_keys=None, file_handle=None):
+    """
+    Calculate optimal batch size based on available memory and tensor sizes
+    """
+    stats = get_memory_stats()
+
+    # Safety factors - leave headroom for OS and other processes
+    CPU_SAFETY_FACTOR = 0.70  # Use 70% of available RAM
+
+    # Calculate available memory
+    cpu_available = stats['cpu']['available']
+    cpu_safe_usable = int(cpu_available * CPU_SAFETY_FACTOR)
+
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.debug(f"[BATCH_CALC] Total RAM: {format_bytes(stats['cpu']['total'])}")
+        logger.debug(f"[BATCH_CALC] Available RAM: {format_bytes(cpu_available)}")
+        logger.debug(f"[BATCH_CALC] Safe usable RAM: {format_bytes(cpu_safe_usable)}")
+
+    # If we have file info, analyze actual tensor sizes for better estimation
+    if safetensor_keys and file_handle:
+        # Sample a few tensors to estimate size distribution
+        sample_keys = safetensor_keys[:min(20, len(safetensor_keys))]  # Sample first 20 tensors
+        tensor_sizes = []
+
+        for key in sample_keys:
+            try:
+                tensor = file_handle.get_tensor(key)
+                # Calculate size in bytes (numel * element_size)
+                tensor_size = tensor.numel() * tensor.element_size()
+                tensor_sizes.append(tensor_size)
+            except:
+                # Fallback if we can't sample
+                tensor_sizes.append(50 * 1024 * 1024)  # 50MB estimate
+
+        if tensor_sizes:
+            avg_tensor_size = sum(tensor_sizes) / len(tensor_sizes)
+            max_tensor_size = max(tensor_sizes)
+
+            # Use weighted average (favor larger tensors for safety)
+            estimated_tensor_size = int(avg_tensor_size * 1.5)  # 50% safety margin
+
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.debug(f"[BATCH_CALC] Sampled {len(tensor_sizes)} tensors")
+                logger.debug(f"[BATCH_CALC] Avg tensor size: {format_bytes(avg_tensor_size)}")
+                logger.debug(f"[BATCH_CALC] Max tensor size: {format_bytes(max_tensor_size)}")
+                logger.debug(f"[BATCH_CALC] Estimated tensor size (with safety): {format_bytes(estimated_tensor_size)}")
+        else:
+            estimated_tensor_size = 50 * 1024 * 1024  # 50MB fallback
+    else:
+        # Fallback estimation based on model size heuristics
+        estimated_tensor_size = 50 * 1024 * 1024  # 50MB default
+
+    # Calculate batch size based on available memory
+    raw_batch_size = max(1, int(cpu_safe_usable // estimated_tensor_size))
+
+    # Apply intelligent limits based on total system memory
+    total_ram_gb = stats['cpu']['total'] / (1024**3)
+
+    if total_ram_gb >= 200:  # High memory systems (200GB+)
+        min_batch_size = 100
+        max_batch_size = 500
+    elif total_ram_gb >= 100:  # Medium-high memory systems (100-200GB)
+        min_batch_size = 50
+        max_batch_size = 200
+    elif total_ram_gb >= 32:  # Medium memory systems (32-100GB)
+        min_batch_size = 20
+        max_batch_size = 100
+    elif total_ram_gb >= 16:  # Low-medium memory systems (16-32GB)
+        min_batch_size = 10
+        max_batch_size = 50
+    else:  # Low memory systems (<16GB)
+        min_batch_size = 2
+        max_batch_size = 20
+
+    # Clamp batch size to reasonable bounds
+    optimal_batch_size = max(min_batch_size, min(max_batch_size, raw_batch_size))
+
+    # Final memory check - ensure batch won't exceed available memory
+    estimated_batch_memory = optimal_batch_size * estimated_tensor_size
+    if estimated_batch_memory > cpu_safe_usable:
+        # Recalculate with stricter limit
+        optimal_batch_size = max(1, int(cpu_safe_usable // estimated_tensor_size))
+
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.debug(f"[BATCH_CALC] Raw calculated batch size: {raw_batch_size}")
+        logger.debug(f"[BATCH_CALC] System tier limits: {min_batch_size}-{max_batch_size}")
+        logger.debug(f"[BATCH_CALC] Final optimal batch size: {optimal_batch_size}")
+        logger.debug(f"[BATCH_CALC] Estimated batch memory usage: {format_bytes(estimated_batch_memory)}")
+        logger.debug(f"[BATCH_CALC] Memory utilization: {(estimated_batch_memory/cpu_safe_usable)*100:.1f}%")
+
+    return optimal_batch_size
+pass
+
+def calculate_dynamic_batch_size(actual_tensor_sizes, available_memory_bytes, safety_factor=0.7):
+    """
+    Calculate batch size based on actual tensor sizes seen so far
+    """
+    if not actual_tensor_sizes:
+        # Initial conservative estimate for first few tensors
+        return min(10, max(2, int(available_memory_bytes // (100 * 1024 * 1024))))  # Assume 100MB per tensor initially
+
+    # Use sliding window average of recent tensor sizes (more responsive to current patterns)
+    recent_window = actual_tensor_sizes[-50:] if len(actual_tensor_sizes) > 50 else actual_tensor_sizes
+    avg_tensor_memory = sum(recent_window) / len(recent_window)
+
+    # Calculate how many tensors can fit in available memory
+    safe_memory = int(available_memory_bytes * safety_factor)
+    optimal_count = max(1, int(safe_memory // avg_tensor_memory))
+
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.debug(f"[DYNAMIC_BATCH] Recent avg tensor size: {format_bytes(avg_tensor_memory)}")
+        logger.debug(f"[DYNAMIC_BATCH] Safe memory: {format_bytes(safe_memory)}")
+        logger.debug(f"[DYNAMIC_BATCH] Optimal batch size: {optimal_count}")
+
+    return optimal_count
+
+def calculate_tensor_memory_cost(W, lora_stats=None, output_dtype=torch.float16):
+    """
+    Calculate actual memory cost of a tensor including LoRA components
+    Similar to _choose_merge_device but focused on memory calculation
+    """
+    base_memory = W.numel() * W.element_size()
+
+    # Add LoRA memory if present
+    lora_memory = 0
+    if lora_stats and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
+        lora_A = lora_stats.lora_A
+        lora_B = lora_stats.lora_B
+        if lora_A is not None and lora_B is not None:
+            # Memory cost during merge (float32 versions)
+            lora_memory = (lora_A.numel() + lora_B.numel()) * 4  # 4 bytes for float32
+
+    # Output tensor memory (in target dtype)
+    output_memory = W.numel() * torch.tensor([], dtype=output_dtype).element_size()
+
+    # Total memory needed during processing (base + lora processing + output)
+    total_memory = base_memory + lora_memory + output_memory
+
+    return total_memory
+
+def adaptive_batch_resize(current_batch_size, current_memory_usage, target_memory_usage):
+    """
+    Dynamically adjust batch size based on actual memory usage during processing
+    """
+    if current_memory_usage == 0:
+        return current_batch_size
+
+    # Calculate scaling factor
+    memory_ratio = target_memory_usage / current_memory_usage
+
+    # Apply conservative scaling (don't change too dramatically)
+    scaling_factor = max(0.5, min(2.0, memory_ratio * 0.8))  # Limit to 50%-200% with dampening
+
+    new_batch_size = max(1, int(current_batch_size * scaling_factor))
+
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.debug(f"[BATCH_ADAPT] Memory ratio: {memory_ratio:.2f}")
+        logger.debug(f"[BATCH_ADAPT] Scaling factor: {scaling_factor:.2f}")
+        logger.debug(f"[BATCH_ADAPT] Batch size: {current_batch_size} -> {new_batch_size}")
+
+    return new_batch_size
+pass
+
+def conservative_memory_cleanup(stage=""):
+    """
+    Cleanup that doesn't hurt performance
+    """
+    if UNSLOTH_ENABLE_LOGGING:
+        pre_stats = get_memory_stats()
+        logger.debug(f"[CLEANUP] Before {stage}: RSS={format_bytes(pre_stats['cpu']['used'])}")
+
+    # Python garbage collection (always safe)
+    for _ in range(3):
+        gc.collect()
+
+    # Clear unused GPU memory (safe, doesn't clear context/kernels)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()  # Only clears unused allocations
+        torch.cuda.synchronize()
+
+    # OS-level memory compaction (safe)
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)  # Return unused heap to OS
+    except:
+        pass
+
+    if UNSLOTH_ENABLE_LOGGING:
+        post_stats = get_memory_stats()
+        freed = pre_stats['cpu']['used'] - post_stats['cpu']['used']
+        logger.debug(f"[CLEANUP] After {stage}: RSS={format_bytes(post_stats['cpu']['used'])}, Freed={format_bytes(freed)}")
 pass
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
