@@ -1212,10 +1212,8 @@ def merge_and_overwrite_lora(
     cleanup_temp_file    = True,
 ):
     import os
-    os.environ['HF_XET_CHUNK_CACHE_SIZE_BYTES']='0'
-    os.environ['HF_HUB_DISABLE_XET']="1"
-    gc.collect()
-    if torch.cuda.is_available(): torch.cuda.empty_cache()
+    #os.environ['HF_XET_CHUNK_CACHE_SIZE_BYTES']='0'
+    #os.environ['HF_HUB_DISABLE_XET']="1"
     conservative_memory_cleanup("between_operations")
     detailed_memory_tracking("MERGE_START", "Initial state")
     # All Unsloth Zoo code licensed under LGPLv3
@@ -1511,6 +1509,7 @@ def merge_and_overwrite_lora(
                 local_dir = save_directory,
             )
             detailed_memory_tracking("AFTER_INDIVIDUAL_DOWNLOAD", f"Downloaded {filename}")
+            conservative_memory_cleanup("between_operations")
         pass
         detailed_memory_tracking("BEFORE_MERGE_OPERATION", f"Starting merge for {filename}")
         n_saved_modules += _merge_and_overwrite_lora(
@@ -1523,8 +1522,7 @@ def merge_and_overwrite_lora(
             quant_type=quant_type,
         )
         detailed_memory_tracking("AFTER_MERGE_OPERATION", f"Completed merge for {filename}")
-        gc.collect()
-        torch.cuda.empty_cache()
+        conservative_memory_cleanup("between_operations")
         detailed_memory_tracking("AFTER_SHARD_CLEANUP", f"Cleaned up after {filename}")
         if low_disk_space_usage and push_to_hub:
             detailed_memory_tracking("BEFORE_SHARD_UPLOAD", f"Uploading {filename}")
@@ -2510,6 +2508,7 @@ def detailed_memory_tracking(stage, key=None, extra_info=None):
 
     # System memory
     system_mem = psutil.virtual_memory()
+    stats = get_memory_stats()
 
     # GPU memory if available
     gpu_info = ""
@@ -2528,7 +2527,7 @@ def detailed_memory_tracking(stage, key=None, extra_info=None):
             f"RSS={mem_info.rss/(1024**3):.1f}GB, "
             f"VMS={mem_info.vms/(1024**3):.1f}GB, "
             f"Percent={mem_percent:.1f}%, "
-            f"System_Used={system_mem.used/(1024**3):.1f}GB ({system_mem.percent:.1f}%), "
+            f"System_Used={(stats['cpu']['available']/(1024**3):.1f}GB ({stats['cpu']['available']/stats['cpu']['total']:.1f}%), "
             f"{gpu_info}{extra_info}"
         )
 
@@ -2552,7 +2551,8 @@ def calculate_optimal_batch_size(safetensor_keys=None, file_handle=None):
     stats = get_memory_stats()
 
     # Safety factors - leave headroom for OS and other processes
-    CPU_SAFETY_FACTOR = 0.70  # Use 70% of available RAM
+    #CPU_SAFETY_FACTOR = 0.70  # Use 70% of available RAM
+    CPU_SAFETY_FACTOR = 0.75
 
     # Calculate available memory
     cpu_available = stats['cpu']['available']
