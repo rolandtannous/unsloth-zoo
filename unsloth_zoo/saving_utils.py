@@ -753,7 +753,7 @@ def merge_and_overwrite_lora(
     if base_model_is_quantized and (quant_type == "nf4" or quant_type == "fp4") and save_method== "merged_16bit":
         warnings.warn("Base model should be a 16bits or mxfp4 base model for a 16bit model merge. Use `save_method=forced_merged_4bit` instead")
         return None
-    if final_model_name == None:
+    if final_model_name is None:
         warnings.warn(f"Model {model_name} not found locally or on HuggingFace")
         return None
     model_name = final_model_name
@@ -799,7 +799,7 @@ def merge_and_overwrite_lora(
                                     max_size_in_bytes = max(max_size_in_bytes, file_size)
                                     total_size_in_bytes += file_size
             except Exception as e:
-                print(f"Warning: Could not process index file: {e}")
+                warnings.warn(f"Warning: Could not process index file: {e}")
     else:
         # Original HF repo logic
         try:
@@ -974,7 +974,7 @@ def merge_and_overwrite_lora(
     final_safetensors_list = []
 
     # Step 5: Iterate through original shards, merge LoRA, and overwrite/save
-    for filename in ProgressBar(safetensors_list, desc = "Unsloth: Merging weights into 16bit"):
+    for filename in ProgressBar(safetensors_list, desc = "Unsloth: Preparing safetensor files"):
         file_path = os.path.join(save_directory, filename)
         # Only download if we didn't get everything from cache AND this specific file doesn't exist
         # AND we're in low disk space mode
@@ -998,7 +998,7 @@ def merge_and_overwrite_lora(
         # NEW: Split file if needed (integrated into existing flow)
         # Split file if needed (creates temp files)
         if needs_splitting:
-            resulting_files = split_file_if_needed(filename, save_directory, max_chunk_size_gb=1.5)
+            resulting_files = split_safetensor_file(filename, save_directory, max_shard_size_gb=1.5)
             conservative_memory_cleanup("between_operations")
         else:
             resulting_files = [filename]
@@ -1008,7 +1008,7 @@ def merge_and_overwrite_lora(
     pass
 
     if needs_splitting:
-        final_safetensors_list = renumber_all_files_cleanly(final_safetensors_list, save_directory)
+        final_safetensors_list = renumber_safetensor_files(final_safetensors_list, save_directory)
 
     for result_filename in ProgressBar(final_safetensors_list, desc="Unsloth: Merging weights into 16bit"):
         n_saved_modules += _merge_and_overwrite_lora(
@@ -2146,7 +2146,7 @@ def should_split_shards(is_t4, model_config, safetensors_list):
     return False
 pass
 
-def split_file_if_needed(filename, save_directory, max_chunk_size_gb=2):
+def split_safetensor_file(filename, save_directory, max_shard_size_gb=2):
     """Split a file if needed, using temporary names to avoid messy numbering."""
     file_path = os.path.join(save_directory, filename)
 
@@ -2154,34 +2154,36 @@ def split_file_if_needed(filename, save_directory, max_chunk_size_gb=2):
         return [filename]
 
     file_size = os.path.getsize(file_path)
-    max_chunk_size_bytes = max_chunk_size_gb * 1024 * 1024 * 1024
+    max_shard_size_bytes = max_shard_size_gb * 1024 * 1024 * 1024
 
-    if file_size <= max_chunk_size_bytes:
+    if file_size <= max_shard_size_bytes:
         return [filename]  # No splitting needed
 
     print(f"Splitting {filename} (size: {file_size / (1024**3):.2f} GB)...")
 
     try:
-        # Split into chunks
-        chunks = split_safetensors_to_chunks(file_path, max_chunk_size_gb)
+        # Split into shards
+        shards = split_safetensors_to_shards(file_path, max_shard_size_gb)
 
         # Create temporary filenames to avoid messy nested numbering
         import uuid
         temp_base = str(uuid.uuid4())[:8]  # Short unique ID
         temp_filenames = []
 
-        for i, chunk in enumerate(chunks):
+        for i, shard in enumerate(shards):
             temp_filename = f"temp_split_{temp_base}_{i:03d}.safetensors"
             temp_file_path = os.path.join(save_directory, temp_filename)
-            save_file(chunk, temp_file_path, metadata={"format": "pt"})
+            save_file(shard, temp_file_path, metadata={"format": "pt"})
             temp_filenames.append(temp_filename)
 
-            chunk_size = sum(tensor.numel() * tensor.element_size() for tensor in chunk.values())
-            print(f"Created temp chunk: {temp_filename} (size: {chunk_size / (1024**3):.2f} GB)")
+            shard_size = sum(tensor.numel() * tensor.element_size() for tensor in shard.values())
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.debug(f"Created temp chunk: {temp_filename} (size: {shard_size / (1024**3):.2f} GB)")
 
         # Remove original file
         os.remove(file_path)
-        print(f"Removed original file: {filename}")
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.debug(f"Removed original file: {filename}")
 
         return temp_filenames
 
@@ -2190,7 +2192,7 @@ def split_file_if_needed(filename, save_directory, max_chunk_size_gb=2):
         return [filename]
 pass
 
-def renumber_all_files_cleanly(file_list, save_directory):
+def renumber_safetensor_files(file_list, save_directory):
     """Renumber all files with clean sequential names."""
     if len(file_list) <= 1:
         # Single file - rename to model.safetensors
@@ -2199,7 +2201,8 @@ def renumber_all_files_cleanly(file_list, save_directory):
             new_path = os.path.join(save_directory, "model.safetensors")
             if os.path.exists(old_path):
                 os.rename(old_path, new_path)
-                print(f"Renamed {file_list[0]} -> model.safetensors")
+                if UNSLOTH_ENABLE_LOGGING:
+                    logger.debug(f"Renamed {file_list[0]} -> model.safetensors")
             return ["model.safetensors"]
         return file_list
 
@@ -2207,7 +2210,8 @@ def renumber_all_files_cleanly(file_list, save_directory):
     total_files = len(file_list)
     clean_names = [f"model-{i+1:05d}-of-{total_files:05d}.safetensors" for i in range(total_files)]
 
-    print("Unsloth: Renumbering files with clean names...")
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.debug("Unsloth: Renumbering safetensor files with sequential numbering...")
 
     # Create mapping of old -> new names
     rename_pairs = list(zip(file_list, clean_names))
@@ -2222,37 +2226,38 @@ def renumber_all_files_cleanly(file_list, save_directory):
             temp_path = os.path.join(save_directory, f"renaming_{new_name}")
             os.rename(old_path, temp_path)
             os.rename(temp_path, new_path)
-            print(f"Renamed {old_name} -> {new_name}")
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.debug(f"Renamed {old_name} -> {new_name}")
 
     return clean_names
 pass
 
-def split_safetensors_to_chunks(file_path, max_chunk_size_gb=2):
-    """Split a safetensors file into smaller chunks."""
-    max_chunk_size = max_chunk_size_gb * 1024 * 1024 * 1024
+def split_safetensors_to_shards(file_path, max_shard_size_gb=2):
+    """Split a safetensors file into smaller shards."""
+    max_shard_size = max_shard_size_gb * 1024 * 1024 * 1024
 
     with safe_open(file_path, framework="pt", device="cpu") as f:
         all_tensors = {key: f.get_tensor(key) for key in f.keys()}
 
-    chunks = []
-    current_chunk = OrderedDict()
+    shards = []
+    current_shard = OrderedDict()
     current_size = 0
 
     for key, tensor in all_tensors.items():
         tensor_size = tensor.numel() * tensor.element_size()
 
-        if current_size + tensor_size > max_chunk_size and current_chunk:
-            chunks.append(current_chunk)
-            current_chunk = OrderedDict()
+        if current_size + tensor_size > max_shard_size and current_shard:
+            shards.append(current_shard)
+            current_shard = OrderedDict()
             current_size = 0
 
-        current_chunk[key] = tensor
+        current_shard[key] = tensor
         current_size += tensor_size
 
-    if current_chunk:
-        chunks.append(current_chunk)
+    if current_shard:
+        shards.append(current_shard)
 
-    return chunks
+    return shards
 pass
 
 def renumber_split_shards(original_filename, num_chunks):
