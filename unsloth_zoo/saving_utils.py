@@ -926,8 +926,7 @@ def merge_and_overwrite_lora(
 
     # Step 3: Conditional index handling
     import subprocess
-    #is_t4 = "Tesla T4" in str(subprocess.check_output(["nvidia-smi"]))
-    is_t4 = True
+    is_t4 = "Tesla T4" in str(subprocess.check_output(["nvidia-smi"]))
     needs_splitting = should_split_shards(is_t4, config, safetensors_list)
     _hf_cache_dir = _get_hf_cache_dir()
     copied_all_from_cache = False
