@@ -2124,12 +2124,8 @@ def should_split_shards(is_t4, model_config, safetensors_list):
     if not is_t4:
         return False
 
-    model_type = getattr(model_config, 'model_type', '').lower()
-    if model_type == 'gpt_oss':
-        return True
-
-    for filename in safetensors_list:
-        if 'gpt-oss' or 'gpt_oss' in filename.lower():
+    if hasattr(model_config, 'model_type'):
+        if model_config.model_type.lower() == 'gpt_oss':
             return True
 
     return False
