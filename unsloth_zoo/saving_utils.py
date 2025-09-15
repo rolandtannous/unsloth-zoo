@@ -26,6 +26,7 @@ from .hf_utils import dtype_from_config
 from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, logger
 
 
+
 try:
     from transformers.integrations.mxfp4 import convert_moe_packed_tensors, convert_moe_packed_tensors_cpu
 except (ImportError, ModuleNotFoundError):
@@ -396,273 +397,237 @@ def _merge_and_overwrite_lora(
     lora_weights,
     output_dtype,
     model_class_name,
-    base_model_is_quantized = False,
-    quant_type = None,
-    overwrite = True, # Overwrites current safetensor file
+    base_model_is_quantized=False,
+    quant_type=None
 ):
-    # All Unsloth Zoo code licensed under LGPLv3
-    # Merges LoRA and overwrites the safetensors file it was merged to
-    filename_original = os.path.join(save_directory, filename)  # Original file path
-    tensors = OrderedDict()
+    """
+    Merges LoRA weights and overwrites the safetensors file using TensorDict memory mapping.
+    """
+    try:
+        from tensordict import TensorDict
+    except ImportError:
+        raise ImportError("TensorDict is required for this feature. Install with: pip install tensordict")
+
+    filename_original = os.path.join(save_directory, filename)
     count = 0
-    import psutil
-    import pickle
-    limit = 700 * 1024 * 1024  # 700MB
 
     # Convert lora_weights to safetensor format
     converted_lora_weights = _convert_lora_keys_to_safetensor_format(
-        lora_weights,
-        [],
-        model_class_name = model_class_name,
-    )
+        lora_weights, [], model_class_name=model_class_name)
 
-    # Open original file for reading
-    raw_pointer = None
-    mm = None
-    raw_safetensor_keys = None
-    header_metadata = None
-    length_of_header = 0
-    # Only if overwriting
-    if overwrite:
-        raw_pointer = open(filename_original, "r+b")
-        # Memory map entire file
-        mm = mmap.mmap(raw_pointer.fileno(), length = 0, access = mmap.ACCESS_WRITE)
-        if mm is None:
-            raw_pointer.flush()
-            raw_pointer.close()
-            overwrite = False
-        else:
-            # Get metadata which is a dict
-            # https://gist.github.com/Narsil/3edeec2669a5e94e4707aa0f901d2282#file-pure_torch-py-L8
-            length_of_header = int.from_bytes(mm.read(8), "little")
-            header_metadata = json.loads(mm.read(length_of_header))
-            mm.seek(0)
-            raw_safetensor_keys = [k for k in header_metadata.keys() if k != "__metadata__"]
-    pass
+    # Create temporary directory for TensorDict memory mapping
+    import tempfile
+    import shutil
+    temp_mmap_dir = tempfile.mkdtemp(prefix="tensordict_mmap_", dir=save_directory)
 
-    with safe_open(filename_original, framework = "pt", device = "cpu") as file:
-        safetensor_keys = list(file.keys())
+    try:
+        # Step 1: Load safetensors and convert to TensorDict
+        with safe_open(filename_original, framework="pt", device="cpu") as file:
+            safetensor_keys = list(file.keys())
 
-        if overwrite and raw_safetensor_keys is not None:
-            # Get keys and compare
-            difference = set(safetensor_keys) ^ set(raw_safetensor_keys)
-            if len(difference) != 0:
-                logger.info("Unsloth: Disabling disk space efficient overwriting and switching to less efficient temporary file approach.")
-                # Disable overwrite
-                overwrite = False
-                mm.flush(); os.fsync(raw_pointer.fileno()); mm.close(); mm = None
-                raw_pointer.flush(); raw_pointer.close(); raw_pointer = None
-        pass
+            # Update converted_lora_weights with actual safetensor keys
+            converted_lora_weights = _convert_lora_keys_to_safetensor_format(
+                lora_weights, safetensor_keys, model_class_name=model_class_name)
 
-        # Update converted_lora_weights with actual safetensor keys
-        converted_lora_weights = _convert_lora_keys_to_safetensor_format(
-            lora_weights,
-            safetensor_keys,
-            model_class_name = model_class_name,
-        )
+            # Handle MXFP4 dequantization and prepare all tensors
+            processed_mxfp4_keys = set()
+            all_tensors = {}
 
-        # Set to track mxfp4 keys that have already been processed
-        processed_mxfp4_keys = set()
+            for key in safetensor_keys:
+                if key in processed_mxfp4_keys:
+                    continue
 
-        for iteration, key in enumerate(safetensor_keys):
-            if key in processed_mxfp4_keys:
-                continue
+                # FORCE memory cleanup before processing each tensor
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
 
-            # FORCE memory cleanup before processing each tensor
-            if not overwrite:
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
+                W = None
+                output_key = key
 
-            W = None
-            output_key = key
-            action_logged = False
-            # --- START OF MODIFIED LOGIC ---
-
-            # Case 1: Base model is MXFP4 quantized
-            if base_model_is_quantized:
-                if quant_type == "mxfp4":
-                    # This block handles ALL keys from a hybrid MXFP4 file.
+                # Handle MXFP4 quantized models
+                if base_model_is_quantized and quant_type == "mxfp4":
                     if key.endswith("_blocks"):
                         if convert_moe_packed_tensors is None:
                             raise ImportError("MXFP4 dequantization is required, but `convert_moe_packed_tensors` could not be imported.")
 
                         base_name = key[:-len("_blocks")]
                         scales_key = base_name + "_scales"
-                        output_key = base_name # Correct naming without .weight
+                        output_key = base_name
+
                         if scales_key not in safetensor_keys:
                             warnings.warn(f"Found mxfp4 tensor {key} but missing its scales tensor {scales_key}. Skipping.")
                             continue
 
                         blocks_tensor, scales_tensor = file.get_tensor(key), file.get_tensor(scales_key)
 
-                        torch.cuda.synchronize() # Wait for previous operations to complete
-                        torch.cuda.empty_cache()
-
-                        # Determine optimal device and chunk size for mxfp4 dequantization
+                        # Determine optimal device and chunk size
                         device_type, device_id, rows_per_chunk = _choose_mxfp4_processing_strategy(
                             blocks_tensor, scales_tensor
                         )
 
-                        # Apply dequantization with optimal parameters
+                        # Apply dequantization
                         if device_type == 'cpu':
-                            # Use CPU-optimized version
                             try:
                                 from transformers.integrations.mxfp4 import convert_moe_packed_tensors_cpu
                                 W = convert_moe_packed_tensors_cpu(
                                     blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
                                 ).transpose(1, 2).contiguous()
                                 if UNSLOTH_ENABLE_LOGGING:
-                                    logger.info(f"[DEBUG] Using CPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
+                                    logger.debug(f"[DEBUG] Using CPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
                             except ImportError:
-                                # Fallback to original function
                                 W = convert_moe_packed_tensors(
                                     blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
                                 ).transpose(1, 2).contiguous()
                         else:
-                            # Use GPU version (original or patched)
                             W = convert_moe_packed_tensors(
                                 blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
                             ).transpose(1, 2).contiguous()
                             if UNSLOTH_ENABLE_LOGGING:
-                                logger.info(f"[DEBUG] Using GPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
+                                logger.debug(f"[DEBUG] Using GPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
 
-                        processed_mxfp4_keys.add(key); processed_mxfp4_keys.add(scales_key)
-
-                        lora_stats = converted_lora_weights.get(base_name, None)
-                        if lora_stats and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
-                            if UNSLOTH_ENABLE_LOGGING:
-                                logger.info(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING LoRA into Key Group: {base_name}")
-                            count += 1; W = _merge_lora(W, lora_stats, output_key)
-                        else:
-                            if UNSLOTH_ENABLE_LOGGING:
-                                logger.info(f"[DEBUG] DEQUANTIZING MXFP4 Key Group: {base_name}")
-                        action_logged = True
+                        del blocks_tensor, scales_tensor
+                        processed_mxfp4_keys.add(key)
+                        processed_mxfp4_keys.add(scales_key)
 
                     elif key.endswith("_scales"):
                         continue
-
                     else:
-                        # Handle the 16-bit tensors (like attention layers)
-                        # that are present in the same file as the MXFP4 tensors.
+                        # Handle 16-bit tensors in hybrid MXFP4 files
                         W = file.get_tensor(key)
+                else:
+                    # Standard 16-bit model
+                    W = file.get_tensor(key)
 
-            else: # This is the general case for a purely 16-bit base model.
-                W = file.get_tensor(key)
+                if W is not None:
+                    # Store tensor in dictionary for TensorDict creation
+                    all_tensors[output_key] = W
+                    del W
+
+        # Step 2: Create TensorDict and memory map it
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.debug(f"Creating TensorDict with {len(all_tensors)} tensors")
+
+        td = TensorDict(all_tensors, batch_size=[])
+        del all_tensors  # Free memory
+
+        # Memory map to disk with multiple threads for speed
+        td_disk = td.memmap(temp_mmap_dir, num_threads=min(8, len(td.keys())))
+        del td  # Free original TensorDict
+
+        # CRITICAL: Unlock the TensorDict for modifications
+        td_disk.unlock_()
+
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.debug(f"TensorDict memory-mapped to {temp_mmap_dir}")
+
+        # Step 3: Merge LoRA weights directly on memory-mapped tensors
+        for key in safetensor_keys:
+            if key in processed_mxfp4_keys and key.endswith("_scales"):
+                continue
+
+            # Determine the output key (handle MXFP4 naming)
+            if base_model_is_quantized and quant_type == "mxfp4" and key.endswith("_blocks"):
+                output_key = key[:-len("_blocks")]
+            else:
+                output_key = key
+
+            if output_key not in td_disk:
+                continue
+
             # Remove .weight suffix to match LoRA key format
             lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
             lora_stats = converted_lora_weights.get(lora_key, None)
 
-            if W is not None and lora_stats is not None and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
-                if not action_logged:
-                    count += 1
-                    W = _merge_lora(W, lora_stats, output_key) # Assume _merge_lora is defined elsewhere
-                    action_logged = True
+            if lora_stats is not None and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
+                if UNSLOTH_ENABLE_LOGGING:
+                    logger.debug(f"[DEBUG] Merging LoRA for key: {output_key}")
 
-            if W is None:
-                continue
+                # Load tensor from memory map
+                original_tensor = td_disk[output_key]
 
-            # Overwriting logic
-            success = False
-            if overwrite and mm is not None and header_metadata is not None:
-                key_metadata = header_metadata[output_key]
-                index_L, index_R = key_metadata["data_offsets"]
-                # dtype = SAFETENSORS_DTYPES[key_metadata["dtype"]]
-                # shape = key_metadata["shape"]
-                index_L += 8 + length_of_header # Indexing via [] uses seek(0)
-                index_R += 8 + length_of_header # Indexing via [] uses seek(0)
-                # array = mm[index_L : index_R]
-                # Transform tensor to numpy bytes format
-                numpy_view = W.to(output_dtype).view(torch.uint8).contiguous().ravel()
-                numpy_view = numpy_view.to("cpu", non_blocking = True).numpy()
+                # Choose optimal merge device
+                #merge_device = _choose_merge_device(original_tensor, lora_stats, output_key)
+
+                # Perform LoRA merge
+                merged_tensor = _merge_lora(original_tensor, lora_stats, output_key)
+
+                # Update the memory-mapped tensor with proper dtype
+                # Update the memory-mapped tensor using set_() for in-place modification
                 try:
-                    # mm[index_L : index_R] = memoryview(numpy_view)
-                    mm.seek(index_L)
-                    mm.write(numpy_view.tobytes())
-                    success = True
-                    del W
-                    del numpy_view
-                except Exception as e:
-                    logger.info(f"Failed overwriting safetensor file at `{output_key}` with error = {str(e)}. Switching to slower version.")
-                    if numpy_view.nbytes != (index_R - index_L):
-                        logger.info(f"Fast saving got incorrect elements with `numpy_view={numpy_view.nbytes}, mmap={index_R-index_L}`")
-                    # Disable overwrite
-                    overwrite = False
-                    mm.flush(); os.fsync(raw_pointer.fileno()); mm.close(); mm = None
-                    raw_pointer.flush(); raw_pointer.close(); raw_pointer = None
-            pass
-            if not success:
-                # Slower and uses more disk space
-                with tempfile.NamedTemporaryFile(suffix = ".pt", delete = False) as temp_file:
-                    temp_filename = temp_file.name
-                    # Save the merged tensor to a unique temp file
-                    torch.save(W.to(output_dtype), temp_filename, pickle_module = pickle, pickle_protocol = pickle.HIGHEST_PROTOCOL)
-                    # Load it back as a memory-mapped object. The OS will manage paging this from disk.
-                    W = torch.load(temp_filename, map_location = "cpu", mmap = True, weights_only = False)
-                pass
-                # Clean up the temporary pickle file immediately after mmaping
-                try:
-                    os.remove(temp_filename)
-                except OSError:
-                    # On Windows, the mmap might keep a handle. The OS will clean it up.
-                    pass
-                # Save to tensors output for saving in the future
-                tensors[output_key] = W
-                # Free up VRAM after each merge
-                torch.cuda.empty_cache()
-            pass
-        pass
-    pass
+                    # Method 1: Use set_() for in-place update
+                    td_disk.set_(output_key, merged_tensor.to(output_dtype).cpu())
+                except Exception as e1:
+                    try:
+                        # Method 2: Direct assignment (should work after unlock_())
+                        td_disk[output_key] = merged_tensor.to(output_dtype).cpu()
+                    except Exception as e2:
+                        # Method 3: Fallback - store for later batch update
+                        if UNSLOTH_ENABLE_LOGGING:
+                            logger.warning(f"Both set_() and direct assignment failed for {output_key}. Using fallback method.")
+                        # We'll handle this in the final conversion step
+                        td_disk._tensordict[output_key] = merged_tensor.to(output_dtype).cpu()
 
-    # CRITICAL: Force cleanup to release file handles on Windows
-    if os.name == "nt":
-        gc.collect()
-        time.sleep(0.1)  # Give Windows a moment to release file handles
+                count += 1
 
-    # Final cleanup for overwrite
-    if overwrite:
-        overwrite = False
-        mm.flush(); os.fsync(raw_pointer.fileno()); mm.close(); mm = None
-        raw_pointer.flush(); raw_pointer.close(); raw_pointer = None
-        gc.collect()
-        # FAST return if overwriting
-        return count
-    pass
+                # Clean up
+                del original_tensor, merged_tensor
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-    # Create a temporary file in the same directory for atomic rename
-    with tempfile.NamedTemporaryFile(suffix = ".safetensors", dir = save_directory, delete = False) as tmpfile:
-        temp_filename_safetensors = tmpfile.name
+        # Step 4: Convert back to safetensors format and save
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.debug("Converting TensorDict back to safetensors format")
 
-    save_file(tensors, temp_filename_safetensors, metadata = {"format": "pt"})  # Save to the temporary safetensors file
-    del tensors
-    # Replace the temporary file with the original file
-    try:
-        os.replace(temp_filename_safetensors, filename_original)  # Attempt atomic rename
-    except OSError as e:
-        # If rename fails (e.g., due to permissions), fall back to copy and remove temporary file
-        print(f"Error renaming temporary file: {e}. Attempting copy and replace.")
-        import shutil
+        # Create final tensors dictionary
+        final_tensors = OrderedDict()
+        for key in td_disk.keys():
+            final_tensors[key] = td_disk[key]
 
-        # On Windows, we might still have the file locking issue with copy
-        if os.name == 'nt':
-            # Try a few times with delays
-            for attempt in range(3):
-                try:
-                    shutil.copy2(temp_filename_safetensors, filename_original)
-                    break
-                except PermissionError:
-                    if attempt == 2:  # Last attempt
-                        raise
-                    time.sleep(0.5)
-                    gc.collect()
-        else:
-            shutil.copy2(temp_filename_safetensors, filename_original)
+        # Save using atomic replacement
+        with tempfile.NamedTemporaryFile(suffix=".safetensors", dir=save_directory, delete=False) as tmpfile:
+            temp_filename_safetensors = tmpfile.name
 
-        # Clean up temp file
+        save_file(final_tensors, temp_filename_safetensors, metadata={"format": "pt"})
+
+        # Atomic replacement
         try:
-            os.remove(temp_filename_safetensors)
-        except:
-            pass
-    pass
+            os.replace(temp_filename_safetensors, filename_original)
+        except OSError as e:
+            print(f"Error renaming temporary file: {e}. Attempting copy and replace.")
+            import shutil
+
+            if os.name == 'nt':
+                for attempt in range(3):
+                    try:
+                        shutil.copy2(temp_filename_safetensors, filename_original)
+                        break
+                    except PermissionError:
+                        if attempt == 2:
+                            raise
+                        time.sleep(0.5)
+                        gc.collect()
+            else:
+                shutil.copy2(temp_filename_safetensors, filename_original)
+
+            try:
+                os.remove(temp_filename_safetensors)
+            except:
+                pass
+
+    finally:
+        # Clean up temporary memory map directory
+        try:
+            if os.path.exists(temp_mmap_dir):
+                shutil.rmtree(temp_mmap_dir)
+        except Exception as e:
+            warnings.warn(f"Failed to cleanup temporary TensorDict directory {temp_mmap_dir}: {e}")
+
+    # Final cleanup
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
     return count
 pass
 
@@ -1114,7 +1079,7 @@ def merge_and_overwrite_lora(
             model_class_name = find_lora_base_model(model).__class__.__name__,
             base_model_is_quantized = base_model_is_quantized,
             quant_type = quant_type,
-            overwrite = True, # Faster overwriting logic
+            #overwrite = True, # Faster overwriting logic
         )
         torch.cuda.empty_cache()
         if low_disk_space_usage and push_to_hub:
@@ -1203,7 +1168,7 @@ def _try_copy_all_from_cache(
     all_found = True
     for filename in filenames_to_check:
         try:
-            cached_path_str = hf_hub_download(repo_id = repo_id, filename = filename, local_files_only = True)
+            cached_path_str = hf_hub_download(repo_id=repo_id, filename=filename, local_files_only=True)
             cached_paths_map[filename] = Path(cached_path_str) # Store Path for checking
         except LocalEntryNotFoundError:
             print(f"Cache check failed: {filename} not found in local cache.") # Verbose
@@ -1729,11 +1694,12 @@ def check_model_quantization_status(model_name_or_path, token=None):
     # HF repo
     else:
         try:
+            from huggingface_hub import hf_hub_download
             config_path = hf_hub_download(
-                repo_id = model_name_or_path,
-                filename = "config.json",
-                cache_dir = None,
-                token = token
+                repo_id=model_name_or_path,
+                filename="config.json",
+                cache_dir=None,
+                token=token
             )
             with open(config_path, 'r', encoding="utf-8") as f:
                 config = json.load(f)
