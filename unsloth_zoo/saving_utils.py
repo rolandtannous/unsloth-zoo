@@ -393,9 +393,7 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
                 continue
 
             # FORCE memory cleanup before processing each tensor
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
+            conservative_memory_cleanup("between_operations")
 
             W = None
             output_key = key
@@ -472,10 +470,10 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
                     else:
                         # Handle the 16-bit tensors (like attention layers)
                         # that are present in the same file as the MXFP4 tensors.
-                        W = file.get_tensor(key)
+                        W = file.get_tensor(key).to("cuda")
 
             else: # This is the general case for a purely 16-bit base model.
-                W = file.get_tensor(key)
+                W = file.get_tensor(key).to("cuda")
             # Remove .weight suffix to match LoRA key format
             lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
             lora_stats = converted_lora_weights.get(lora_key, None)
@@ -494,7 +492,7 @@ def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dty
 
             with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as temp_file:
                 temp_filename = temp_file.name
-                # Save the merged tensor to a unique temp file
+                W = W.cpu()                # Save the merged tensor to a unique temp file
                 torch.save(W.to(output_dtype), temp_filename, pickle_module=pickle, pickle_protocol=pickle.HIGHEST_PROTOCOL)
                 # Load it back as a memory-mapped object. The OS will manage paging this from disk.
                 W = torch.load(temp_filename, map_location="cpu", mmap=True, weights_only=False)
