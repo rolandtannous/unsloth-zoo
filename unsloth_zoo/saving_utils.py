@@ -546,7 +546,7 @@ pass
 # pass
 #
 @torch.inference_mode
-def _merge_and_overwrite_lora_generic(save_directory, filename, lora_weights, output_dtype, model_class_name, base_model_is_quantized=False, quant_type=None):
+def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, output_dtype, model_class_name, base_model_is_quantized=False, quant_type=None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
     filename_original = os.path.join(save_directory, filename)  # Original file path
@@ -584,77 +584,73 @@ def _merge_and_overwrite_lora_generic(save_directory, filename, lora_weights, ou
             action_logged = False
             # --- START OF MODIFIED LOGIC ---
 
-            # Case 1: Base model is MXFP4 quantized
-            if base_model_is_quantized:
-                if quant_type == "mxfp4":
-                    # This block handles ALL keys from a hybrid MXFP4 file.
-                    if key.endswith("_blocks"):
-                        if convert_moe_packed_tensors is None:
-                            raise ImportError("MXFP4 dequantization is required, but `convert_moe_packed_tensors` could not be imported.")
+            # This block handles ALL keys from a hybrid MXFP4 file.
+            if key.endswith("_blocks"):
+                if convert_moe_packed_tensors is None:
+                    raise ImportError("MXFP4 dequantization is required, but `convert_moe_packed_tensors` could not be imported.")
 
-                        base_name = key[:-len("_blocks")]
-                        scales_key = base_name + "_scales"
-                        output_key = base_name # Correct naming without .weight
-                        if scales_key not in safetensor_keys:
-                            warnings.warn(f"Found mxfp4 tensor {key} but missing its scales tensor {scales_key}. Skipping.")
-                            continue
+                base_name = key[:-len("_blocks")]
+                scales_key = base_name + "_scales"
+                output_key = base_name # Correct naming without .weight
+                if scales_key not in safetensor_keys:
+                    warnings.warn(f"Found mxfp4 tensor {key} but missing its scales tensor {scales_key}. Skipping.")
+                    continue
 
-                        blocks_tensor, scales_tensor = file.get_tensor(key), file.get_tensor(scales_key)
+                blocks_tensor, scales_tensor = file.get_tensor(key), file.get_tensor(scales_key)
 
-                        if torch.cuda.is_available():
-                          torch.cuda.synchronize()  # Wait for previous operations to complete
-                          torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                  torch.cuda.synchronize()  # Wait for previous operations to complete
+                  torch.cuda.empty_cache()
 
-                        # Determine optimal device and chunk size for mxfp4 dequantization
-                        device_type, device_id, rows_per_chunk = _choose_mxfp4_processing_strategy(
-                            blocks_tensor, scales_tensor
-                        )
+                # Determine optimal device and chunk size for mxfp4 dequantization
+                device_type, device_id, rows_per_chunk = _choose_mxfp4_processing_strategy(
+                    blocks_tensor, scales_tensor
+                )
 
-                        # Apply dequantization with optimal parameters
-                        if device_type == 'cpu':
-                            # Use CPU-optimized version
-                            try:
-                                from transformers.integrations.mxfp4 import convert_moe_packed_tensors_cpu
-                                W = convert_moe_packed_tensors_cpu(
-                                    blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
-                                ).transpose(1, 2).contiguous()
-                                if UNSLOTH_ENABLE_LOGGING:
-                                    logger.info(f"[DEBUG] Using CPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
-                            except ImportError:
-                                # Fallback to original function
-                                W = convert_moe_packed_tensors(
-                                    blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
-                                ).transpose(1, 2).contiguous()
-                        else:
-                            # Use GPU version (original or patched)
-                            W = convert_moe_packed_tensors(
-                                blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
-                            ).transpose(1, 2).contiguous()
-                            if UNSLOTH_ENABLE_LOGGING:
-                                logger.info(f"[DEBUG] Using GPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
+                # Apply dequantization with optimal parameters
+                if device_type == 'cpu':
+                    # Use CPU-optimized version
+                    try:
+                        from transformers.integrations.mxfp4 import convert_moe_packed_tensors_cpu
+                        W = convert_moe_packed_tensors_cpu(
+                            blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
+                        ).transpose(1, 2).contiguous()
+                        if UNSLOTH_ENABLE_LOGGING:
+                            logger.info(f"[DEBUG] Using CPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
+                    except ImportError:
+                        # Fallback to original function
+                        W = convert_moe_packed_tensors(
+                            blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
+                        ).transpose(1, 2).contiguous()
+                else:
+                    # Use GPU version (original or patched)
+                    W = convert_moe_packed_tensors(
+                        blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
+                    ).transpose(1, 2).contiguous()
+                    if UNSLOTH_ENABLE_LOGGING:
+                        logger.info(f"[DEBUG] Using GPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
 
-                        processed_mxfp4_keys.add(key); processed_mxfp4_keys.add(scales_key)
+                processed_mxfp4_keys.add(key); processed_mxfp4_keys.add(scales_key)
 
-                        lora_stats = converted_lora_weights.get(base_name, None)
-                        if lora_stats and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
-                            if UNSLOTH_ENABLE_LOGGING:
-                                logger.info(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING LoRA into Key Group: {base_name}")
-                            count += 1; W = _merge_lora(W, lora_stats, output_key)
-                        else:
-                            if UNSLOTH_ENABLE_LOGGING:
-                                logger.info(f"[DEBUG] DEQUANTIZING MXFP4 Key Group: {base_name}")
-                        action_logged = True
+                lora_stats = converted_lora_weights.get(base_name, None)
+                if lora_stats and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
+                    if UNSLOTH_ENABLE_LOGGING:
+                        logger.info(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING LoRA into Key Group: {base_name}")
+                    count += 1; W = _merge_lora(W, lora_stats, output_key)
+                else:
+                    if UNSLOTH_ENABLE_LOGGING:
+                        logger.info(f"[DEBUG] DEQUANTIZING MXFP4 Key Group: {base_name}")
+                action_logged = True
 
-                    elif key.endswith("_scales"):
-                        continue
+            elif key.endswith("_scales"):
+                continue
 
-                    else:
-                        # Handle the 16-bit tensors (like attention layers)
-                        # that are present in the same file as the MXFP4 tensors.
-                        W = file.get_tensor(key)
-
-            else: # This is the general case for a purely 16-bit base model.
+            else:
+                # Handle the 16-bit tensors (like attention layers)
+                # that are present in the same file as the MXFP4 tensors.
                 W = file.get_tensor(key)
+
+
             # Remove .weight suffix to match LoRA key format
             lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
             lora_stats = converted_lora_weights.get(lora_key, None)
@@ -748,7 +744,7 @@ def _merge_and_overwrite_lora(
             logger.info("mxfp4 quantized model detected. Using safe rewrite strategy (requires temporary disk space).")
         # Here, we fall back to the complete rewrite logic.
         # This logic is extracted from your original 'working_code'.
-        return _merge_and_overwrite_lora_generic(
+        return _merge_and_overwrite_lora_mxfp4(
             save_directory, filename, lora_weights, output_dtype,
             model_class_name, base_model_is_quantized, quant_type
         )
