@@ -1313,7 +1313,7 @@ def merge_and_overwrite_lora(
     final_safetensors_list = []
 
     # Step 5: Iterate through original shards, merge LoRA, and overwrite/save
-    for filename in ProgressBar(safetensors_list, desc = "Unsloth: Merging Preparing safetensor files"):
+    for filename in ProgressBar(safetensors_list, desc = "Unsloth: Preparing safetensor files"):
         file_path = os.path.join(save_directory, filename)
         # Only download if we didn't get everything from cache AND this specific file doesn't exist
         # AND we're in low disk space mode
@@ -1345,6 +1345,9 @@ def merge_and_overwrite_lora(
     if needs_splitting:
         final_safetensors_list = renumber_safetensor_files(final_safetensors_list, save_directory)
 
+    regenerate_index = ((base_model_is_quantized and quant_type == "mxfp4") or needs_splitting) and len(final_safetensors_list) > 1
+    weight_map = {}
+
     for filename in ProgressBar(final_safetensors_list, desc="Unsloth: Merging weights into 16bit"):
         n_saved_modules += _merge_and_overwrite_lora(
             save_directory = save_directory,
@@ -1357,6 +1360,16 @@ def merge_and_overwrite_lora(
             #overwrite = True, # Faster overwriting logic
         )
         torch.cuda.empty_cache()
+
+        file_path = os.path.join(save_directory, filename)
+
+        # --- NEW LOGIC: Build the weight_map BEFORE deleting the file ---
+        if regenerate_index:
+            # We must open the file we just created to get its tensor keys
+            with safe_open(file_path, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    weight_map[key] = filename
+
         if low_disk_space_usage and push_to_hub:
             upload_items(filename)
             os.remove(os.path.join(save_directory, filename)) # Remove to conserve disk space
@@ -1364,18 +1377,10 @@ def merge_and_overwrite_lora(
     pass
 
 
-    # Step 6: Regenerate index ONLY for MXFP4 dequantization
-    if ((base_model_is_quantized and quant_type == "mxfp4") or needs_splitting) and len(final_safetensors_list) > 1:
-        print("Unsloth: Regenerating safetensors index for dequantized MXFP4 model...")
-        weight_map = {}
-
-        for filename in final_safetensors_list:
-            file_path = os.path.join(save_directory, filename)
-            # Important check for low_disk_space mode where files might be deleted
-            if not os.path.exists(file_path): continue
-            with safe_open(file_path, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    weight_map[key] = filename
+    # Step 6: Write the regenerated index (if needed)
+    if regenerate_index:
+        # The logic is now simpler: we just write the map we already built.
+        print("Unsloth: Writing regenerated safetensors index...")
 
         index_data = {"metadata": {}, "weight_map": weight_map}
         index_path = os.path.join(save_directory, "model.safetensors.index.json")
