@@ -878,10 +878,8 @@ def merge_and_overwrite_lora(
         model_name = get_model_name(model.config._name_or_path, load_in_4bit = False)
     except:
         model_name = model.config._name_or_path
-        model_name = model_name.removesuffix("-unsloth-bnb-4bit").removesuffix("-bnb-4bit")
 
     final_model_name, is_local_path, source_info, base_model_is_quantized, quant_type = determine_base_model_source(model_name, token)
-    print(f"value of base_model_is_quantized is {base_model_is_quantized}")
     if base_model_is_quantized and (quant_type == "nf4" or quant_type == "fp4") and save_method== "merged_16bit":
         warnings.warn("Base model should be a 16bits or mxfp4 base model for a 16bit model merge. Use `save_method=forced_merged_4bit` instead")
         return None
@@ -1243,7 +1241,9 @@ def _try_copy_all_from_cache(
     for filename in filenames_to_check:
         try:
             cached_path_str = hf_hub_download(repo_id=repo_id, filename=filename, local_files_only=True)
+            print(f"cached_path_str: {cached_path_str}")
             cached_paths_map[filename] = Path(cached_path_str) # Store Path for checking
+            all_found=True
         except LocalEntryNotFoundError:
             print(f"Cache check failed: {filename} not found in local cache.") # Verbose
             all_found = False
