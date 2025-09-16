@@ -1090,7 +1090,11 @@ def merge_and_overwrite_lora(
     final_model_name, is_local_path, source_info, base_model_is_quantized, quant_type = determine_base_model_source(model_name, token)
     print(f"value of base_model_is_quantized is {base_model_is_quantized}")
     if base_model_is_quantized and (quant_type == "nf4" or quant_type == "fp4") and save_method== "merged_16bit":
-        raise TypeError("Base model should be a 16bits or mxfp4 base model for a 16bit model merge. Use `save_method=forced_merged_4bit` instead")
+        warnings.warn("Base model should be a 16bits or mxfp4 base model for a 16bit model merge. Use `save_method=forced_merged_4bit` instead")
+        return None
+    if final_model_name is None:
+        warnings.warn(f"Model {model_name} not found locally or on HuggingFace")
+        return None
     model_name = final_model_name
     safetensors_list = []
     max_size_in_bytes = 0
@@ -1134,7 +1138,7 @@ def merge_and_overwrite_lora(
                                     max_size_in_bytes = max(max_size_in_bytes, file_size)
                                     total_size_in_bytes += file_size
             except Exception as e:
-                print(f"Warning: Could not process index file: {e}")
+                warnings.warn(f"Warning: Could not process index file: {e}")
     else:
         # Original HF repo logic
         try:
@@ -1257,12 +1261,15 @@ def merge_and_overwrite_lora(
         upload_items()
 
     # Step 3: Conditional index handling
+    import subprocess
+    is_t4 = "Tesla T4" in str(subprocess.check_output(["nvidia-smi"]))
+    needs_splitting = should_split_shards(is_t4, config, safetensors_list)
     _hf_cache_dir = _get_hf_cache_dir()
     copied_all_from_cache = False
     safe_tensor_index_files = ["model.safetensors.index.json"] if len(safetensors_list) > 1 else []
 
     # ONLY download/copy the original index if we are NOT dequantizing an MXFP4 model
-    if not (base_model_is_quantized and quant_type == "mxfp4"):
+    if not (base_model_is_quantized and quant_type == "mxfp4") and not needs_splitting:
         if is_local_path:
             os.makedirs(save_directory, exist_ok=True)
             # Copy from local
@@ -1303,9 +1310,10 @@ def merge_and_overwrite_lora(
             local_dir_use_symlinks = False,
         )
 
+    final_safetensors_list = []
 
     # Step 5: Iterate through original shards, merge LoRA, and overwrite/save
-    for filename in ProgressBar(safetensors_list, desc = "Unsloth: Merging weights into 16bit"):
+    for filename in ProgressBar(safetensors_list, desc = "Unsloth: Merging Preparing safetensor files"):
         file_path = os.path.join(save_directory, filename)
         # Only download if we didn't get everything from cache AND this specific file doesn't exist
         # AND we're in low disk space mode
@@ -1324,6 +1332,20 @@ def merge_and_overwrite_lora(
                 local_dir = save_directory,
             )
         pass
+
+        if needs_splitting:
+            resulting_files = split_safetensor_file(filename, save_directory, max_shard_size_gb=1.5)
+        else:
+            resulting_files = [filename]
+
+        # Collect all resulting files (temp names if split, original names if not)
+        final_safetensors_list.extend(resulting_files)
+    pass
+
+    if needs_splitting:
+        final_safetensors_list = renumber_safetensor_files(final_safetensors_list, save_directory)
+
+    for filename in ProgressBar(final_safetensors_list, desc="Unsloth: Merging weights into 16bit"):
         n_saved_modules += _merge_and_overwrite_lora(
             save_directory = save_directory,
             filename = filename,
@@ -1341,12 +1363,13 @@ def merge_and_overwrite_lora(
         pass
     pass
 
+
     # Step 6: Regenerate index ONLY for MXFP4 dequantization
-    if base_model_is_quantized and quant_type == "mxfp4" and len(safetensors_list) > 1:
+    if ((base_model_is_quantized and quant_type == "mxfp4") or needs_splitting) and len(final_safetensors_list) > 1:
         print("Unsloth: Regenerating safetensors index for dequantized MXFP4 model...")
         weight_map = {}
 
-        for filename in safetensors_list:
+        for filename in final_safetensors_list:
             file_path = os.path.join(save_directory, filename)
             # Important check for low_disk_space mode where files might be deleted
             if not os.path.exists(file_path): continue
@@ -1361,7 +1384,6 @@ def merge_and_overwrite_lora(
 
         if push_to_hub:
             upload_items("model.safetensors.index.json")
-        print("Unsloth: Merge process completed.")
 
     # Step 7: Final upload of all shards if not using low disk space mode and pushing
     if not low_disk_space_usage and push_to_hub:
@@ -1392,6 +1414,7 @@ def merge_and_overwrite_lora(
         except Exception as e:
             print(f"Warning: Failed to remove temporary directory {save_directory}: {e}")
     pass
+    print("Unsloth: Merge process complete.")
 
     return save_directory
 pass
@@ -1928,8 +1951,112 @@ def check_hf_model_exists(model_name, token=None):
 pass
 
 def check_local_model_exists(model_path):
-    """Check if model exists locally"""
-    return os.path.exists(model_path) and os.path.isdir(model_path)
+    """
+    Check if model exists locally with case insensitive naming patterns.
+    Returns the actual path if found, None otherwise.
+    """
+
+    def has_safetensors(directory):
+        """Check if directory contains safetensors files"""
+        if not os.path.exists(directory) or not os.path.isdir(directory):
+            return False
+        try:
+            for file in os.listdir(directory):
+                if file.endswith(".safetensors"):
+                    return True
+            return False
+        except (OSError, PermissionError):
+            return False
+
+    def find_case_insensitive_path(target_path):
+        """Find a path that matches case-insensitively"""
+        if os.path.exists(target_path):
+            return target_path
+
+        # Split path into components
+        parts = target_path.split(os.sep)
+        current_path = ""
+
+        for i, part in enumerate(parts):
+            if i == 0:
+                # Handle first part (could be relative or absolute)
+                if part == "":  # absolute path starting with /
+                    current_path = os.sep
+                    continue
+                elif part == ".":
+                    current_path = "."
+                else:
+                    current_path = part
+            else:
+                current_path = os.path.join(current_path, part)
+
+            # If this exact path exists, continue
+            if os.path.exists(current_path):
+                continue
+
+            # Try to find case-insensitive match
+            parent_path = os.path.dirname(current_path) if i > 0 else "."
+            target_name = os.path.basename(current_path).lower()
+
+            if not os.path.exists(parent_path):
+                return None
+
+            try:
+                found_match = False
+                for item in os.listdir(parent_path):
+                    if item.lower() == target_name:
+                        current_path = os.path.join(parent_path, item)
+                        found_match = True
+                        break
+
+                if not found_match:
+                    return None
+            except (OSError, PermissionError):
+                return None
+
+        return current_path if os.path.exists(current_path) else None
+
+    # List of path patterns to check
+    paths_to_check = []
+
+    # 1. Exact path as given
+    paths_to_check.append(model_path)
+
+    # 2. Case-insensitive version of full path
+    case_insensitive_full = find_case_insensitive_path(model_path)
+    if case_insensitive_full:
+        paths_to_check.append(case_insensitive_full)
+
+    # 3. If path contains "/", also check just the model name part
+    if "/" in model_path:
+        model_name = model_path.split("/")[-1]  # Get part after last "/"
+
+        # Exact model name
+        paths_to_check.append(model_name)
+
+        # Case-insensitive model name in current directory
+        try:
+            for item in os.listdir("."):
+                if item.lower() == model_name.lower():
+                    paths_to_check.append(item)
+                    break
+        except (OSError, PermissionError):
+            pass
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_paths = []
+    for path in paths_to_check:
+        if path and path not in seen:
+            seen.add(path)
+            unique_paths.append(path)
+
+    # Check each path and verify it contains safetensors
+    for path in unique_paths:
+        if has_safetensors(path):
+            return os.path.abspath(path)  # Return absolute path
+
+    return None
 pass
 
 def check_model_quantization_status(model_name_or_path, token=None):
@@ -1986,39 +2113,35 @@ def determine_base_model_source(model_name, token=None):
 
     # Check availability
     hf_exists = check_hf_model_exists(model_name, token)
-    local_exists = check_local_model_exists(model_name)
+    local_path = check_local_model_exists(model_name)
 
-    # Branch A: HF model exists
+    # Get quantization status for both if they exist
+    hf_is_quantized, hf_quant_type = None, None
+    local_is_quantized, local_quant_type = None, None
+
     if hf_exists:
         hf_is_quantized, hf_quant_type = check_model_quantization_status(model_name, token)
 
-        if not hf_is_quantized:
-            # A1: HF unquantized exists → use HF
-            return (model_name, False, "HF_unquantized", False, None)
-        else:
-            # A2: HF is quantized, check if local unquantized exists
-            if local_exists:
-                local_is_quantized, local_quant_type = check_model_quantization_status(model_name)
-                if not local_is_quantized:
-                    # A2a: Local unquantized exists → use local
-                    return (model_name, True, "local_unquantized_preferred_over_HF_quantized", False, None)
-                else:
-                    # A2b: Both quantized → use HF (more reliable)
-                    return (model_name, False, "HF_quantized", True, hf_quant_type)
-            else:
-                # A3: Only HF quantized exists
-                return (model_name, False, "HF_quantized_only", True, hf_quant_type)
+    if local_path:
+        local_is_quantized, local_quant_type = check_model_quantization_status(local_path)
 
-    # Branch B: HF model doesn't exist
-    else:
-        if local_exists:
-            # B1: Any local exists → use local
-            local_is_quantized, local_quant_type = check_model_quantization_status(model_name)
-            status = "quantized" if local_is_quantized else "unquantized"
-            return (model_name, True, f"local_{status}_only", local_is_quantized, local_quant_type)
-        else:
-            # B2: Nothing found
-            raise ValueError(f"Model {model_name} not found locally or on HuggingFace")
+    # Priority 1: Local unquantized OR Local mxfp4
+    if local_path and (not local_is_quantized or local_quant_type == "mxfp4"):
+        if not local_is_quantized:
+            return (local_path, True, "local_unquantized", False, None)
+        else:  # local_quant_type == "mxfp4"
+            return (local_path, True, "local_mxfp4", True, "mxfp4")
+
+    # Priority 2: HF unquantized
+    if hf_exists and not hf_is_quantized:
+        return (model_name, False, "HF_unquantized", False, None)
+
+    # Priority 3: HF quantized (covers both "both quantized" and "just HF quantized")
+    if hf_exists and hf_is_quantized:
+        return (model_name, False, f"HF_{hf_quant_type}", True, hf_quant_type)
+
+    # Priority 4: Nothing suitable found
+    return (None, False, "", False, None)
 pass
 
 def get_memory_stats():
@@ -2233,6 +2356,134 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
 
     return (best_fallback['device_type'], best_fallback['device_id'], fallback_chunk_size)
 pass
+
+def should_split_shards(is_t4, model_config, safetensors_list):
+    """Determine if we need to split shards based on T4 and GPT-OSS conditions."""
+    if not is_t4:
+        return False
+
+    if hasattr(model_config, 'model_type'):
+        if model_config.model_type.lower() == 'gpt_oss':
+            return True
+
+    return False
+pass
+
+def split_safetensor_file(filename, save_directory, max_shard_size_gb=2):
+    """Split a file if needed, using temporary names to avoid messy numbering."""
+    file_path = os.path.join(save_directory, filename)
+
+    if not os.path.exists(file_path):
+        return [filename]
+
+    file_size = os.path.getsize(file_path)
+    max_shard_size_bytes = max_shard_size_gb * 1024 * 1024 * 1024
+
+    if file_size <= max_shard_size_bytes:
+        return [filename]  # No splitting needed
+
+    print(f"Splitting {filename} (size: {file_size / (1024**3):.2f} GB)...")
+
+    try:
+        # Split into shards
+        shards = split_safetensors_to_shards(file_path, max_shard_size_gb)
+
+        # Create temporary filenames to avoid messy nested numbering
+        import uuid
+        temp_base = str(uuid.uuid4())[:8]  # Short unique ID
+        temp_filenames = []
+
+        for i, shard in enumerate(shards):
+            temp_filename = f"temp_split_{temp_base}_{i:03d}.safetensors"
+            temp_file_path = os.path.join(save_directory, temp_filename)
+            save_file(shard, temp_file_path, metadata={"format": "pt"})
+            temp_filenames.append(temp_filename)
+
+            shard_size = sum(tensor.numel() * tensor.element_size() for tensor in shard.values())
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.debug(f"Created temp chunk: {temp_filename} (size: {shard_size / (1024**3):.2f} GB)")
+
+        # Remove original file
+        os.remove(file_path)
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.debug(f"Removed original file: {filename}")
+
+        return temp_filenames
+
+    except Exception as e:
+        print(f"Error splitting {filename}: {e}")
+        return [filename]
+pass
+
+def renumber_safetensor_files(file_list, save_directory):
+    """Renumber all files with clean sequential names."""
+    if len(file_list) <= 1:
+        # Single file - rename to model.safetensors
+        if len(file_list) == 1 and file_list[0] != "model.safetensors":
+            old_path = os.path.join(save_directory, file_list[0])
+            new_path = os.path.join(save_directory, "model.safetensors")
+            if os.path.exists(old_path):
+                os.rename(old_path, new_path)
+                if UNSLOTH_ENABLE_LOGGING:
+                    logger.debug(f"Renamed {file_list[0]} -> model.safetensors")
+            return ["model.safetensors"]
+        return file_list
+
+    # Multiple files - use clean numbering
+    total_files = len(file_list)
+    clean_names = [f"model-{i+1:05d}-of-{total_files:05d}.safetensors" for i in range(total_files)]
+
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.debug("Unsloth: Renumbering safetensor files with sequential numbering...")
+
+    # Create mapping of old -> new names
+    rename_pairs = list(zip(file_list, clean_names))
+
+    # Rename files (handle potential conflicts with temp names)
+    for old_name, new_name in rename_pairs:
+        old_path = os.path.join(save_directory, old_name)
+        new_path = os.path.join(save_directory, new_name)
+
+        if os.path.exists(old_path) and old_name != new_name:
+            # Use temp name to avoid conflicts
+            temp_path = os.path.join(save_directory, f"renaming_{new_name}")
+            os.rename(old_path, temp_path)
+            os.rename(temp_path, new_path)
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.debug(f"Renamed {old_name} -> {new_name}")
+
+    return clean_names
+pass
+
+def split_safetensors_to_shards(file_path, max_shard_size_gb=2):
+    """Split a safetensors file into smaller shards."""
+    max_shard_size = max_shard_size_gb * 1024 * 1024 * 1024
+
+    with safe_open(file_path, framework="pt", device="cpu") as f:
+        all_tensors = {key: f.get_tensor(key) for key in f.keys()}
+
+    shards = []
+    current_shard = OrderedDict()
+    current_size = 0
+
+    for key, tensor in all_tensors.items():
+        tensor_size = tensor.numel() * tensor.element_size()
+
+        if current_size + tensor_size > max_shard_size and current_shard:
+            shards.append(current_shard)
+            current_shard = OrderedDict()
+            current_size = 0
+
+        current_shard[key] = tensor
+        current_size += tensor_size
+
+    if current_shard:
+        shards.append(current_shard)
+
+    return shards
+pass
+
+
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
