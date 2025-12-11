@@ -923,19 +923,19 @@ pass
 def is_hf_sharded_safetensors(filenames: list[str]) -> bool:
     """Check if filenames follow HF sharded naming: model-00001-of-00005.safetensors"""
     pattern = re.compile(r'^(.+?)-(\d+)-of-(\d+)\.safetensors$')
-    
+
     matches = [pattern.match(f) for f in filenames]
     if not all(matches):
         return False
-    
+
     # Keep strings to check padding
     parsed = [(m.group(1), m.group(2), m.group(3)) for m in matches]
-    
+
     # shard and total have same padding: turned off as deepseekocr padding is different
     # for prefix, shard_str, total_str in parsed:
     #     if len(shard_str) != len(total_str):
     #         return False
-    
+
     # same prefix and total
     prefixes, _, totals = zip(*parsed)
     return len(set(prefixes)) == 1 and len(set(totals)) == 1
@@ -1191,6 +1191,7 @@ def merge_and_overwrite_lora(
     copied_all_from_cache = False
     copied_tokenizer_model_from_cache = False
     is_hf_sharded = is_hf_sharded_safetensors(safetensors_list)
+    has_enough_space = check_disk_space(repo_id = model_name, directory = _hf_cache_dir, token = token, safety_multiplier = 3)
     safe_tensor_index_files = ["model.safetensors.index.json"] if (len(safetensors_list) > 1 or is_hf_sharded) else []
 
     # ONLY download/copy the original index if we are NOT dequantizing an MXFP4 model
@@ -1211,12 +1212,18 @@ def merge_and_overwrite_lora(
         else:
             # Download from HF
             if "model.safetensors.index.json" in [f for f in safe_tensor_index_files]:
-                snapshot_download(
-                    repo_id = model_name,
-                    local_dir = save_directory,
-                    allow_patterns = ["model.safetensors.index.json"],
-                    local_dir_use_symlinks = False,
-                )
+                if has_enough_space:
+                    hf_hub_download(
+                        repo_id = model_name,
+                        filename = "model.safetensors.index.json"
+                    )
+                else:
+                    snapshot_download(
+                        repo_id = model_name,
+                        local_dir = save_directory,
+                        allow_patterns = ["model.safetensors.index.json"],
+                        local_dir_use_symlinks = False,
+                    )
 
         if push_to_hub and safe_tensor_index_files:
             upload_items("model.safetensors.index.json")
@@ -1242,21 +1249,47 @@ def merge_and_overwrite_lora(
 
     if not copied_all_from_cache and not low_disk_space_usage and not is_local_path:
         print(f"Downloading safetensors for {model_name}...")
-        snapshot_download(
-            repo_id = model_name,
-            local_dir = save_directory,
-            allow_patterns = safe_tensor_index_files + safetensors_list,
-            local_dir_use_symlinks = False,
-        )
+        if has_enough_space:
+            hf_hub_download(
+                repo_id = model_name,
+                allow_patterns = safe_tensor_index_files + safetensors_list,
+            )
+            _try_copy_all_from_cache(
+                repo_id = model_name,
+                filenames_to_check = safe_tensor_index_files + safetensors_list,
+                target_dir_str = save_directory,
+                hf_cache_dir = _hf_cache_dir,
+                token = token,
+            )
+        else:
+            snapshot_download(
+                repo_id = model_name,
+                local_dir = save_directory,
+                allow_patterns = safe_tensor_index_files + safetensors_list,
+                local_dir_use_symlinks = False,
+            )
 
     if not copied_tokenizer_model_from_cache and not low_disk_space_usage and not is_local_path:
         print(f"Attempting to download tokenizer.model for {model_name}...")
-        snapshot_download(
-            repo_id = model_name,
-            local_dir = save_directory,
-            allow_patterns = ["tokenizer.model"],
-            local_dir_use_symlinks = False,
-        )
+        if has_enough_space:
+            snapshot_download(
+                repo_id = model_name,
+                allow_patterns = ["tokenizer.model"],
+            )
+            _try_copy_all_from_cache(
+                repo_id = model_name,
+                filenames_to_check = ["tokenizer.model"],
+                target_dir_str = save_directory,
+                hf_cache_dir = _hf_cache_dir,
+                token = token
+            )
+        else:
+            snapshot_download(
+                repo_id = model_name,
+                local_dir = save_directory,
+                allow_patterns = ["tokenizer.model"],
+                local_dir_use_symlinks = False,
+            )
 
     final_safetensors_list = []
 
@@ -1381,8 +1414,15 @@ def merge_and_overwrite_lora(
         try:
             shutil.rmtree(save_directory)
         except Exception as e:
-            print(f"Warning: Failed to remove temporary directory {save_directory}: {e}")
+            warnings.warn(f"Warning: Failed to remove temporary directory {save_directory}: {e}")
     pass
+    # clean model files if has_enough_space is false.
+    if not has_enough_space:
+        try:
+            shutil.rmtree(os.path.join(save_directory, ".cache"))
+        except Exception as e:
+            warnings.warn(f"Warning: Failed to remove temp model files directory {os.path.join(save_directory, ".cache")}: {e}")
+
     print(f"Unsloth: Merge process complete. Saved to `{os.path.abspath(save_directory)}`")
 
     return save_directory
@@ -2505,6 +2545,113 @@ def _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Direct tensor write failed for {output_key}: {e}")
         return False
+pass
+
+def get_hf_repo_size(repo_id, token=None):
+    """
+    Get the total size of a HuggingFace repository in bytes.
+    Tries multiple methods with fallbacks.
+
+    Args:
+        repo_id: The HuggingFace model repository ID
+        token: Optional HuggingFace token for private repos
+
+    Returns:
+        tuple: (total_size_bytes, max_file_size_bytes) or (float('inf'), float('inf')) if all methods fail
+    """
+    # Method 1: Try HfApi.model_info (fastest and most reliable)
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=token)
+        model_info = api.model_info(repo_id=repo_id, files_metadata=True)
+        total_bytes = sum(x.size or 0 for x in model_info.siblings)
+        max_bytes = max((x.size or 0 for x in model_info.siblings), default=0)
+        if total_bytes > 0:
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.info(f"Repo size for {repo_id}: {total_bytes / 1_000_000_000:.2f} GB (via HfApi)")
+            return total_bytes, max_bytes
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            warnings.warn(f"HfApi.model_info failed for {repo_id}: {e}")
+
+    # Method 2: Try HfFileSystem.ls (fallback)
+    try:
+        from huggingface_hub import HfFileSystem
+        file_list = HfFileSystem(token=token).ls(repo_id, detail=True)
+        total_bytes = 0
+        max_bytes = 0
+        for x in file_list:
+            if "size" in x:
+                total_bytes += x["size"]
+                max_bytes = max(max_bytes, x["size"])
+        if total_bytes > 0:
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.info(f"Repo size for {repo_id}: {total_bytes / 1_000_000_000:.2f} GB (via HfFileSystem)")
+            return total_bytes, max_bytes
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            warnings.warn(f"HfFileSystem.ls failed for {repo_id}: {e}")
+
+    # All methods failed - return infinity to be safe
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.warning(f"Could not determine repo size for {repo_id}, assuming infinite size for safety")
+        return float('inf'), float('inf')
+pass
+
+def check_disk_space(repo_id, directory, token=None, safety_multiplier=3):
+    """
+    Check if there's enough disk space to download and cache a model.
+    Requires available space >= safety_multiplier * model_size
+    """
+    import shutil
+
+    # Get model size
+    total_bytes, max_bytes = get_hf_repo_size(repo_id, token=token)
+
+    # Get available disk space
+    try:
+        total, used, free = shutil.disk_usage(directory)
+        available_bytes = int(free * 0.95)  # Use 95% of reported free space
+    except Exception as e:
+        logger.warning("Could not check disk space")
+        return False
+
+    # Calculate required space (safety_multiplier times the model size)
+    required_bytes = total_bytes * safety_multiplier if total_bytes != float('inf') else float('inf')
+
+    # Convert to GB for readability
+    available_gb = available_bytes / 1_000_000_000
+    required_gb = required_bytes / 1_000_000_000 if required_bytes != float('inf') else float('inf')
+    model_gb = total_bytes / 1_000_000_000 if total_bytes != float('inf') else float('inf')
+
+    has_enough_space = available_bytes >= required_bytes
+
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info(
+            f"Disk space check: Model size: {model_gb:.2f} GB, "
+            f"Required ({safety_multiplier}x): {required_gb:.2f} GB, "
+            f"Available: {available_gb:.2f} GB"
+        )
+
+    if not has_enough_space:
+        if required_gb == float('inf'):
+            warnings.warn(
+                f"Unsloth: Could not determine model size for {repo_id}. "
+                f"Available disk space: {available_gb:.2f} GB. "
+                f"Please ensure you have sufficient space (recommend at least 100 GB for large models)."
+            )
+            return False
+        else:
+            warnings.warn(
+                f"Unsloth: Insufficient disk space in {directory}.\n"
+                f"Model size: {model_gb:.2f} GB\n"
+                f"Required space ({safety_multiplier}x for safety): {required_gb:.2f} GB\n"
+                f"Available space: {available_gb:.2f} GB\n"
+                f"Shortfall: {required_gb - available_gb:.2f} GB"
+            )
+            return False
+
+    return has_enough_space
 pass
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
